@@ -1,2 +1,3 @@
 build/
-test_spike_db.dat
+tmp/
+.vscode/
