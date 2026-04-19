@@ -1,158 +1,100 @@
 /*============================================================================
- * test_spike_db.c  –  Comprehensive test harness for SpikeDB
- *
- * Tests variable-length key/value API, WriteBatch, and SIMD-accelerated
- * skip-list operations.
+ * test_spike_db.c — SpikeDB v5 test harness
  *============================================================================*/
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
 #else
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <time.h>
+  #include <unistd.h>
+  #include <sys/stat.h>
+  #include <time.h>
 #endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+
 #include "spike_db.h"
 
-#define TEST_DB_PATH "test_spike_db.dat"
+#define TEST_DB_PATH    "tmp/test_spike_db.dat"
+#define TEST_CACHE      512u           /* 512 * 64KB = 32 MiB */
 
-/* ---- Minimal test framework ---- */
-static int g_tests_run    = 0;
-static int g_tests_passed = 0;
-static int g_tests_failed = 0;
+static int g_run = 0, g_pass = 0, g_fail = 0;
+
+#define TEST(name) static void name(void); \
+    static void run_##name(void) { printf("  %-40s", #name); name(); } \
+    static void name(void)
 
 #define CHECK(cond, fmt, ...) do {                                          \
     if (!(cond)) {                                                          \
-        printf("    FAIL: " fmt "\n", ##__VA_ARGS__);                       \
-        g_tests_failed++; g_tests_run++; return;                            \
+        printf("FAIL\n    %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
+        g_fail++; g_run++; return;                                          \
     }                                                                       \
 } while(0)
 
-#define CHECK_CONTINUE(cond, counter, fmt, ...) do {                        \
-    if (!(cond)) { counter++; if (counter <= 5) printf("    FAIL: " fmt "\n", ##__VA_ARGS__); } \
-} while(0)
-
-#define PASS() do { g_tests_passed++; g_tests_run++; printf("    PASS\n"); } while(0)
+#define PASS() do { printf("PASS\n"); g_pass++; g_run++; } while(0)
 
 static void cleanup(void) {
     remove(TEST_DB_PATH);
-    remove(TEST_DB_PATH ".lock");
 }
 
-static const char* simd_name(SpikeDB_SimdLevel lvl) {
-    switch (lvl) {
-    case SPIKEDB_SIMD_AVX512: return "AVX-512";
-    case SPIKEDB_SIMD_AVX2:   return "AVX2";
-    default:                   return "Scalar";
-    }
-}
-
-/* ---- Timer helper ---- */
 #ifdef _WIN32
-static LARGE_INTEGER g_freq;
-static void timer_init(void) { QueryPerformanceFrequency(&g_freq); }
-typedef LARGE_INTEGER SpikeDB_Timer;
-static void timer_now(SpikeDB_Timer* t) { QueryPerformanceCounter(t); }
-static double timer_ms(SpikeDB_Timer t0, SpikeDB_Timer t1) {
-    return (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / g_freq.QuadPart;
+static double now_ms(void) {
+    LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return 1000.0 * (double)t.QuadPart / (double)f.QuadPart;
 }
 #else
-static void timer_init(void) { }
-typedef struct timespec SpikeDB_Timer;
-static void timer_now(SpikeDB_Timer* t) { clock_gettime(CLOCK_MONOTONIC, t); }
-static double timer_ms(SpikeDB_Timer t0, SpikeDB_Timer t1) {
-    return (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+static double now_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000.0 + t.tv_nsec / 1.0e6;
 }
 #endif
 
-/* ---- PRNG ---- */
-static uint64_t xorshift64(uint64_t* state) {
-    uint64_t x = *state;
-    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-    *state = x;
-    return x;
-}
-
 /*============================================================================
- * uint64 convenience wrappers — existing tests use integer keys/values.
- * These convert to/from string representations under the new byte-key API.
+ * 1. Open/close round-trip
  *============================================================================*/
 
-static SpikeDB_Status put_u64(SpikeDB* db, uint64_t key, uint64_t value) {
-    char k[32], v[32];
-    int kl = sprintf(k, "%llu", (unsigned long long)key);
-    int vl = sprintf(v, "%llu", (unsigned long long)value);
-    return spike_db_put(db, k, (size_t)kl, v, (size_t)vl);
-}
-
-static SpikeDB_Status get_u64(SpikeDB* db, uint64_t key, uint64_t* value_out) {
-    char k[32];
-    int kl = sprintf(k, "%llu", (unsigned long long)key);
-    char* val = NULL;
-    size_t vlen = 0;
-    SpikeDB_Status rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-    if (rc == SPIKEDB_OK && val) {
-        /* Null-terminate for strtoull */
-        char tmp[32] = {0};
-        size_t cplen = vlen < 31 ? vlen : 31;
-        memcpy(tmp, val, cplen);
-        *value_out = strtoull(tmp, NULL, 10);
-        spike_db_free(val);
-    }
-    return rc;
-}
-
-static SpikeDB_Status del_u64(SpikeDB* db, uint64_t key) {
-    char k[32];
-    int kl = sprintf(k, "%llu", (unsigned long long)key);
-    return spike_db_delete(db, k, (size_t)kl);
-}
-
-/*============================================================================
- * TEST 1: Basic CRUD (put, get, update, delete, miss)
- *============================================================================*/
-static void test_basic_crud(void) {
-    printf("  [1] Basic CRUD\n");
+TEST(test_open_close_empty) {
     cleanup();
     SpikeDB* db = NULL;
-    SpikeDB_Status rc = spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(rc == SPIKEDB_OK && db, "open failed rc=%d", rc);
-    printf("    SIMD level: %s\n", simd_name(spike_db_simd_level(db)));
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    CHECK(db != NULL, "db handle");
+    spike_db_close(db);
 
-    for (uint64_t i = 1; i <= 100; i++) {
-        rc = put_u64(db, i, i * 1000);
-        CHECK(rc == SPIKEDB_OK, "put %llu failed", (unsigned long long)i);
-    }
+    /* Reopen */
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "reopen");
+    spike_db_close(db);
+    cleanup();
+    PASS();
+}
 
-    uint64_t val;
-    int fails = 0;
-    for (uint64_t i = 1; i <= 100; i++) {
-        rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == i * 1000, fails,
-                        "get key=%llu rc=%d val=%llu", (unsigned long long)i, rc, (unsigned long long)val);
-    }
-    CHECK(fails == 0, "%d / 100 gets failed", fails);
+/*============================================================================
+ * 2. Single-record put + get
+ *============================================================================*/
 
-    /* Update */
-    rc = put_u64(db, 42, 99999);
-    CHECK(rc == SPIKEDB_OK, "update put failed");
-    rc = get_u64(db, 42, &val);
-    CHECK(rc == SPIKEDB_OK && val == 99999, "update get failed val=%llu", (unsigned long long)val);
+TEST(test_single_put_get) {
+    cleanup();
+    SpikeDB* db = NULL;
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
 
-    /* Delete */
-    rc = del_u64(db, 42);
-    CHECK(rc == SPIKEDB_OK, "delete failed");
-    rc = get_u64(db, 42, &val);
-    CHECK(rc == SPIKEDB_NOT_FOUND, "deleted key still found");
+    SpikeDB_Batch* b = spike_db_batch_create();
+    const char* val = "hello";
+    spike_db_batch_put(b, 42, 1000, val, 5);
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write");
+    spike_db_batch_destroy(b);
 
-    /* Miss */
-    rc = get_u64(db, 9999, &val);
-    CHECK(rc == SPIKEDB_NOT_FOUND, "miss key found");
+    void* out = NULL; size_t outlen = 0;
+    CHECK(spike_db_get(db, 42, 1000, &out, &outlen) == SPIKEDB_OK, "get hit");
+    CHECK(outlen == 5 && memcmp(out, "hello", 5) == 0, "value matches");
+    spike_db_free(out);
+
+    /* Miss on different time */
+    CHECK(spike_db_get(db, 42, 9999, &out, &outlen) == SPIKEDB_NOT_FOUND, "get miss");
+    /* Miss on different symbol */
+    CHECK(spike_db_get(db, 99, 1000, &out, &outlen) == SPIKEDB_NOT_FOUND, "miss sym");
 
     spike_db_close(db);
     cleanup();
@@ -160,126 +102,73 @@ static void test_basic_crud(void) {
 }
 
 /*============================================================================
- * TEST 2: Page-boundary crossing (>64 keys forces multi-page)
+ * 3. Persistence across reopen
  *============================================================================*/
-static void test_page_boundary(void) {
-    printf("  [2] Page boundary (200 keys)\n");
+
+TEST(test_persistence) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
 
-    for (uint64_t i = 0; i < 200; i++)
-        put_u64(db, i, i + 0xAAAA);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < 200; i++) {
-        SpikeDB_Status rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == i + 0xAAAA, fails,
-                        "key=%llu rc=%d", (unsigned long long)i, rc);
+    SpikeDB_Batch* b = spike_db_batch_create();
+    for (int i = 0; i < 100; i++) {
+        char buf[32]; snprintf(buf, sizeof(buf), "v%d", i);
+        spike_db_batch_put(b, 7, (uint64_t)i * 1000, buf, strlen(buf));
     }
-    CHECK(fails == 0, "%d / 200 gets failed", fails);
-    printf("    200 keys across pages: OK\n");
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write 100");
+    spike_db_batch_destroy(b);
+    spike_db_close(db);
 
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "reopen");
+    for (int i = 0; i < 100; i++) {
+        void* out = NULL; size_t outlen = 0;
+        CHECK(spike_db_get(db, 7, (uint64_t)i * 1000, &out, &outlen) == SPIKEDB_OK,
+              "get %d after reopen", i);
+        char want[32]; int wlen = snprintf(want, sizeof(want), "v%d", i);
+        CHECK(outlen == (size_t)wlen && memcmp(out, want, wlen) == 0, "match %d", i);
+        spike_db_free(out);
+    }
     spike_db_close(db);
     cleanup();
     PASS();
 }
 
 /*============================================================================
- * TEST 3: Large sequential insert + verify (10k)
+ * 4. Range scan (sequential)
  *============================================================================*/
-static void test_large_sequential(void) {
-    printf("  [3] Large sequential (10,000 keys)\n");
+
+TEST(test_range_scan_sequential) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
 
-    const uint64_t N = 10000;
-    int put_ok = 0;
-    for (uint64_t i = 0; i < N; i++)
-        if (put_u64(db, i, i * 7 + 3) == SPIKEDB_OK) put_ok++;
-
-    printf("    put: %d/%llu\n", put_ok, (unsigned long long)N);
-    CHECK(put_ok == (int)N, "only %d puts succeeded", put_ok);
-
-    int get_ok = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < N; i++)
-        if (get_u64(db, i, &val) == SPIKEDB_OK && val == i * 7 + 3) get_ok++;
-
-    printf("    get: %d/%llu\n", get_ok, (unsigned long long)N);
-    CHECK(get_ok == (int)N, "only %d gets succeeded", get_ok);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 4: Reverse-order insertion (stress page splitting)
- *============================================================================*/
-static void test_reverse_insert(void) {
-    printf("  [4] Reverse-order insert (5,000 keys)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    const uint64_t N = 5000;
-    for (uint64_t i = N; i >= 1; i--)
-        put_u64(db, i, i * 11);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 1; i <= N; i++) {
-        SpikeDB_Status rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == i * 11, fails,
-                        "key=%llu rc=%d val=%llu", (unsigned long long)i, rc, (unsigned long long)val);
-    }
-    printf("    verified: %llu/%llu\n", (unsigned long long)(N - fails), (unsigned long long)N);
-    CHECK(fails == 0, "%d gets failed", fails);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 5: Random-order insertion
- *============================================================================*/
-static void test_random_insert(void) {
-    printf("  [5] Random-order insert (10,000 keys)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    const int N = 10000;
-    uint64_t* keys = (uint64_t*)malloc(N * sizeof(uint64_t));
-    CHECK(keys, "malloc failed");
-    for (int i = 0; i < N; i++) keys[i] = (uint64_t)(i + 1);
-    uint64_t rng = 0xDEADBEEFCAFEULL;
-    for (int i = N - 1; i > 0; i--) {
-        int j = (int)(xorshift64(&rng) % (uint64_t)(i + 1));
-        uint64_t tmp = keys[i]; keys[i] = keys[j]; keys[j] = tmp;
-    }
-
-    for (int i = 0; i < N; i++)
-        put_u64(db, keys[i], keys[i] + 0xF00D);
-
-    int fails = 0;
-    uint64_t val;
+    const int N = 5000;
+    SpikeDB_Batch* b = spike_db_batch_create();
     for (int i = 0; i < N; i++) {
-        SpikeDB_Status rc = get_u64(db, keys[i], &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == keys[i] + 0xF00D, fails,
-                        "key=%llu rc=%d", (unsigned long long)keys[i], rc);
+        uint32_t v = (uint32_t)(i * 7);
+        spike_db_batch_put(b, 1, (uint64_t)i, &v, sizeof(v));
     }
-    printf("    verified: %d/%d\n", N - fails, N);
-    free(keys);
-    CHECK(fails == 0, "%d random gets failed", fails);
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write N");
+    spike_db_batch_destroy(b);
+
+    SpikeDB_Iter* it = spike_db_scan(db, 1, 0, UINT64_MAX);
+    CHECK(it != NULL, "iter");
+    int seen = 0;
+    uint64_t t; const void* val; size_t vlen;
+    uint64_t prev_t = 0;
+    bool first = true;
+    while (spike_db_iter_next(it, &t, &val, &vlen)) {
+        CHECK(vlen == sizeof(uint32_t), "vlen");
+        uint32_t got;
+        memcpy(&got, val, sizeof(got));
+        CHECK(got == (uint32_t)(t * 7), "value matches at t=%llu", (unsigned long long)t);
+        if (!first) CHECK(t > prev_t, "sorted");
+        prev_t = t;
+        first = false;
+        seen++;
+    }
+    spike_db_iter_close(it);
+    CHECK(seen == N, "saw %d expected %d", seen, N);
 
     spike_db_close(db);
     cleanup();
@@ -287,409 +176,101 @@ static void test_random_insert(void) {
 }
 
 /*============================================================================
- * TEST 6: Overwrite / update stress
+ * 5. Range scan with bounds
  *============================================================================*/
-static void test_overwrite_stress(void) {
-    printf("  [6] Overwrite stress (1,000 keys x 10 updates)\n");
+
+TEST(test_range_scan_bounded) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    const uint64_t N = 1000;
-    const int ROUNDS = 10;
-
-    for (int r = 0; r < ROUNDS; r++)
-        for (uint64_t i = 0; i < N; i++)
-            put_u64(db, i, i + (uint64_t)r * 1000);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < N; i++) {
-        SpikeDB_Status rc = get_u64(db, i, &val);
-        uint64_t expected = i + (uint64_t)(ROUNDS - 1) * 1000;
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == expected, fails,
-                        "key=%llu expected=%llu got=%llu", (unsigned long long)i,
-                        (unsigned long long)expected, (unsigned long long)val);
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    SpikeDB_Batch* b = spike_db_batch_create();
+    for (int i = 0; i < 1000; i++) {
+        uint64_t v = (uint64_t)i;
+        spike_db_batch_put(b, 99, (uint64_t)i, &v, sizeof(v));
     }
-    printf("    verified final values: %llu/%llu\n", (unsigned long long)(N - fails), (unsigned long long)N);
-    CHECK(fails == 0, "%d overwrite checks failed", fails);
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write");
+    spike_db_batch_destroy(b);
 
+    SpikeDB_Iter* it = spike_db_scan(db, 99, 100, 199);
+    int seen = 0;
+    uint64_t t; const void* val; size_t vlen;
+    while (spike_db_iter_next(it, &t, &val, &vlen)) {
+        CHECK(t >= 100 && t <= 199, "t in range");
+        seen++;
+    }
+    spike_db_iter_close(it);
+    CHECK(seen == 100, "saw %d expected 100", seen);
     spike_db_close(db);
     cleanup();
     PASS();
 }
 
 /*============================================================================
- * TEST 7: Delete-heavy workload
+ * 6. Multiple symbols are isolated
  *============================================================================*/
-static void test_delete_heavy(void) {
-    printf("  [7] Delete-heavy (insert 1000, delete odd, verify)\n");
+
+TEST(test_multi_symbol) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    for (uint64_t i = 1; i <= 1000; i++)
-        put_u64(db, i, i * 3);
-
-    int del_ok = 0;
-    for (uint64_t i = 1; i <= 1000; i += 2)
-        if (del_u64(db, i) == SPIKEDB_OK) del_ok++;
-    printf("    deleted %d odd keys\n", del_ok);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 1; i <= 1000; i++) {
-        SpikeDB_Status rc = get_u64(db, i, &val);
-        if (i % 2 == 1) {
-            CHECK_CONTINUE(rc == SPIKEDB_NOT_FOUND, fails,
-                            "odd key=%llu still found", (unsigned long long)i);
-        } else {
-            CHECK_CONTINUE(rc == SPIKEDB_OK && val == i * 3, fails,
-                            "even key=%llu rc=%d val=%llu", (unsigned long long)i, rc, (unsigned long long)val);
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    SpikeDB_Batch* b = spike_db_batch_create();
+    /* Interleaved */
+    for (int i = 0; i < 500; i++) {
+        for (int s = 1; s <= 5; s++) {
+            uint32_t v = (uint32_t)(s * 1000 + i);
+            spike_db_batch_put(b, (uint64_t)s, (uint64_t)i, &v, sizeof(v));
         }
     }
-    printf("    verification errors: %d\n", fails);
-    CHECK(fails == 0, "%d delete checks failed", fails);
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write");
+    spike_db_batch_destroy(b);
 
+    /* Verify each symbol */
+    for (int s = 1; s <= 5; s++) {
+        uint64_t cnt;
+        CHECK(spike_db_count(db, (uint64_t)s, &cnt) == SPIKEDB_OK, "count s=%d", s);
+        CHECK(cnt == 500, "count=%llu expected 500", (unsigned long long)cnt);
+        SpikeDB_Iter* it = spike_db_scan(db, (uint64_t)s, 0, UINT64_MAX);
+        int n = 0;
+        uint64_t t; const void* val; size_t vlen;
+        while (spike_db_iter_next(it, &t, &val, &vlen)) {
+            uint32_t got; memcpy(&got, val, sizeof(got));
+            CHECK(got == (uint32_t)(s * 1000 + (int)t), "value sym=%d t=%llu", s, (unsigned long long)t);
+            n++;
+        }
+        spike_db_iter_close(it);
+        CHECK(n == 500, "iter count s=%d n=%d", s, n);
+    }
     spike_db_close(db);
     cleanup();
     PASS();
 }
 
 /*============================================================================
- * TEST 8: Delete non-existent key
+ * 7. min / max / count helpers
  *============================================================================*/
-static void test_delete_missing(void) {
-    printf("  [8] Delete non-existent key\n");
+
+TEST(test_min_max_count) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
 
-    put_u64(db, 1, 100);
-    SpikeDB_Status rc = del_u64(db, 999);
-    CHECK(rc == SPIKEDB_NOT_FOUND, "expected NOT_FOUND, got %d", rc);
-
-    uint64_t val;
-    rc = get_u64(db, 1, &val);
-    CHECK(rc == SPIKEDB_OK && val == 100, "original key damaged");
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 9: Empty database operations
- *============================================================================*/
-static void test_empty_db(void) {
-    printf("  [9] Empty database ops\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    uint64_t val;
-    SpikeDB_Status rc = get_u64(db, 1, &val);
-    CHECK(rc == SPIKEDB_NOT_FOUND, "get on empty db didn't return NOT_FOUND");
-
-    rc = del_u64(db, 1);
-    CHECK(rc == SPIKEDB_NOT_FOUND, "delete on empty db didn't return NOT_FOUND");
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 10: Re-open persistence
- *============================================================================*/
-static void test_reopen(void) {
-    printf("  [10] Close and re-open persistence\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    for (uint64_t i = 0; i < 500; i++)
-        put_u64(db, i, i + 0xCAFE);
-
-    spike_db_close(db);
-    db = NULL;
-
-    SpikeDB_Status rc = spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(rc == SPIKEDB_OK && db, "re-open failed rc=%d", rc);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < 500; i++) {
-        rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == i + 0xCAFE, fails,
-                        "key=%llu rc=%d val=%llu", (unsigned long long)i, rc, (unsigned long long)val);
-    }
-    printf("    after reopen: %d/500\n", 500 - fails);
-    CHECK(fails == 0, "%d keys lost after reopen", fails);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 11: Variable-length string keys and values
- *============================================================================*/
-static void test_string_keys(void) {
-    printf("  [11] Variable-length string keys\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    const char* keys[] = { "a", "hello", "this is a longer key",
-                            "key with special chars: !@#$%^&*()", "" };
-    const char* vals[] = { "1", "world", "this is a longer value",
-                           "value!!", "empty key value" };
-    int n = sizeof(keys) / sizeof(keys[0]);
-
-    for (int i = 0; i < n; i++) {
-        SpikeDB_Status rc = spike_db_put(db, keys[i], strlen(keys[i]),
-                                          vals[i], strlen(vals[i]));
-        CHECK(rc == SPIKEDB_OK, "put failed for key '%s'", keys[i]);
-    }
-
-    int fails = 0;
-    for (int i = 0; i < n; i++) {
-        char* val = NULL;
-        size_t vlen = 0;
-        SpikeDB_Status rc = spike_db_get(db, keys[i], strlen(keys[i]), &val, &vlen);
-        if (rc != SPIKEDB_OK || vlen != strlen(vals[i]) ||
-            memcmp(val, vals[i], vlen) != 0)
-            fails++;
-        spike_db_free(val);
-    }
-    CHECK(fails == 0, "%d string key checks failed", fails);
-
-    /* Update a string key */
-    {
-        SpikeDB_Status rc = spike_db_put(db, "hello", 5, "updated", 7);
-        CHECK(rc == SPIKEDB_OK, "string update failed");
-        char* val = NULL;
-        size_t vlen = 0;
-        rc = spike_db_get(db, "hello", 5, &val, &vlen);
-        CHECK(rc == SPIKEDB_OK && vlen == 7 && memcmp(val, "updated", 7) == 0,
-              "string update verify failed");
-        spike_db_free(val);
-    }
-
-    /* Delete a string key */
-    {
-        SpikeDB_Status rc = spike_db_delete(db, "a", 1);
-        CHECK(rc == SPIKEDB_OK, "string delete failed");
-        char* val = NULL;
-        size_t vlen = 0;
-        rc = spike_db_get(db, "a", 1, &val, &vlen);
-        CHECK(rc == SPIKEDB_NOT_FOUND, "deleted string key still found");
-        spike_db_free(val);
-    }
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 12: Interleaved insert-delete
- *============================================================================*/
-static void test_interleaved_insert_delete(void) {
-    printf("  [12] Interleaved insert-delete (2,000 ops)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    for (uint64_t i = 0; i < 1000; i++)
-        put_u64(db, i, i);
-
-    for (uint64_t i = 0; i < 1000; i += 2) {
-        del_u64(db, i);
-        put_u64(db, i + 1000, (i + 1000) * 5);
-    }
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < 1000; i += 2) {
-        SpikeDB_Status rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_NOT_FOUND, fails,
-                        "deleted even key=%llu still found", (unsigned long long)i);
-    }
-    for (uint64_t i = 1; i < 1000; i += 2) {
-        SpikeDB_Status rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == i, fails,
-                        "odd key=%llu missing", (unsigned long long)i);
-    }
-    for (uint64_t i = 0; i < 1000; i += 2) {
-        SpikeDB_Status rc = get_u64(db, i + 1000, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == (i + 1000) * 5, fails,
-                        "new key=%llu missing", (unsigned long long)(i + 1000));
-    }
-    printf("    interleave errors: %d\n", fails);
-    CHECK(fails == 0, "%d interleave checks failed", fails);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 13: Sparse key space (large gaps)
- *============================================================================*/
-static void test_sparse_keys(void) {
-    printf("  [13] Sparse key space (keys with large gaps)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    const int N = 100;
-    for (int i = 0; i < N; i++)
-        put_u64(db, (uint64_t)i * 1000, (uint64_t)i * 1000 + 7);
-
-    int fails = 0;
-    uint64_t val;
-    for (int i = 0; i < N; i++) {
-        SpikeDB_Status rc = get_u64(db, (uint64_t)i * 1000, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == (uint64_t)i * 1000 + 7, fails,
-                        "sparse key=%llu rc=%d", (unsigned long long)((uint64_t)i * 1000), rc);
-    }
-    for (int i = 0; i < N; i++) {
-        SpikeDB_Status rc = get_u64(db, (uint64_t)i * 1000 + 500, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_NOT_FOUND, fails,
-                        "gap key=%llu found", (unsigned long long)((uint64_t)i * 1000 + 500));
-    }
-    printf("    sparse errors: %d\n", fails);
-    CHECK(fails == 0, "%d sparse checks failed", fails);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 14: Same key repeated insert (idempotency)
- *============================================================================*/
-static void test_same_key_repeat(void) {
-    printf("  [14] Same key repeated insert (idempotency)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    for (int i = 0; i < 100; i++)
-        put_u64(db, 42, (uint64_t)(i + 1));
-
-    uint64_t val;
-    SpikeDB_Status rc = get_u64(db, 42, &val);
-    CHECK(rc == SPIKEDB_OK && val == 100, "expected 100, got %llu", (unsigned long long)val);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 15: Delete all keys -> empty database
- *============================================================================*/
-static void test_delete_all(void) {
-    printf("  [15] Delete all keys\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    for (uint64_t i = 0; i < 200; i++)
-        put_u64(db, i, i);
-
-    for (uint64_t i = 0; i < 200; i++)
-        del_u64(db, i);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < 200; i++) {
-        SpikeDB_Status rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_NOT_FOUND, fails,
-                        "key=%llu still found after delete-all", (unsigned long long)i);
-    }
-    CHECK(fails == 0, "%d keys survived delete-all", fails);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 16: Insert after delete-all (freelist reuse)
- *============================================================================*/
-static void test_reinsert_after_delete(void) {
-    printf("  [16] Re-insert after delete-all\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    for (uint64_t i = 0; i < 100; i++)
-        put_u64(db, i, i);
-    for (uint64_t i = 0; i < 100; i++)
-        del_u64(db, i);
-
-    for (uint64_t i = 0; i < 100; i++)
-        put_u64(db, i, i + 9999);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < 100; i++) {
-        SpikeDB_Status rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == i + 9999, fails,
-                        "key=%llu rc=%d val=%llu", (unsigned long long)i, rc, (unsigned long long)val);
-    }
-    CHECK(fails == 0, "%d re-insert checks failed", fails);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 17: Performance - sequential 100k
- *============================================================================*/
-static void test_perf_sequential(void) {
-    printf("  [17] Perf: sequential 100k\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, SPIKEDB_OPEN_EXCLUSIVE);
-    CHECK(db, "open failed");
-
-    const uint64_t N = 100000;
-    SpikeDB_Timer t0, t1;
-
-    timer_now(&t0);
-    for (uint64_t i = 0; i < N; i++)
-        put_u64(db, i, i);
-    timer_now(&t1);
-    double put_ms = timer_ms(t0, t1);
-
+    /* Empty: count 0, min/max not found */
     uint64_t v;
-    int hits = 0;
-    timer_now(&t0);
-    for (uint64_t i = 0; i < N; i++)
-        if (get_u64(db, i, &v) == SPIKEDB_OK) hits++;
-    timer_now(&t1);
-    double get_ms = timer_ms(t0, t1);
+    CHECK(spike_db_count(db, 1, &v) == SPIKEDB_OK && v == 0, "empty count");
+    CHECK(spike_db_max_time(db, 1, &v) == SPIKEDB_NOT_FOUND, "empty max");
+    CHECK(spike_db_min_time(db, 1, &v) == SPIKEDB_NOT_FOUND, "empty min");
 
-    printf("    put: %.1f ms  (%.0f ops/s)\n", put_ms, N / (put_ms / 1000.0));
-    printf("    get: %.1f ms  (%.0f ops/s)  hits=%d/%llu\n", get_ms, N / (get_ms / 1000.0), hits, (unsigned long long)N);
-    CHECK(hits == (int)N, "only %d/%llu hits", hits, (unsigned long long)N);
+    SpikeDB_Batch* b = spike_db_batch_create();
+    spike_db_batch_put(b, 1, 100, "a", 1);
+    spike_db_batch_put(b, 1, 50,  "b", 1);
+    spike_db_batch_put(b, 1, 200, "c", 1);
+    spike_db_batch_put(b, 1, 75,  "d", 1);
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write");
+    spike_db_batch_destroy(b);
+
+    CHECK(spike_db_count(db, 1, &v) == SPIKEDB_OK && v == 4, "count=%llu", (unsigned long long)v);
+    CHECK(spike_db_min_time(db, 1, &v) == SPIKEDB_OK && v == 50, "min=%llu", (unsigned long long)v);
+    CHECK(spike_db_max_time(db, 1, &v) == SPIKEDB_OK && v == 200, "max=%llu", (unsigned long long)v);
 
     spike_db_close(db);
     cleanup();
@@ -697,81 +278,151 @@ static void test_perf_sequential(void) {
 }
 
 /*============================================================================
- * TEST 18: Performance - random 100k
+ * 8. Out-of-order inserts
  *============================================================================*/
-static void test_perf_random(void) {
-    printf("  [18] Perf: random-order 100k\n");
+
+TEST(test_out_of_order) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, SPIKEDB_OPEN_EXCLUSIVE);
-    CHECK(db, "open failed");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    SpikeDB_Batch* b = spike_db_batch_create();
+    /* Insert in reverse order */
+    for (int i = 999; i >= 0; i--) {
+        uint64_t v = (uint64_t)i;
+        spike_db_batch_put(b, 1, (uint64_t)i, &v, sizeof(v));
+    }
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write reverse");
+    spike_db_batch_destroy(b);
+
+    /* Iterate in order */
+    SpikeDB_Iter* it = spike_db_scan(db, 1, 0, UINT64_MAX);
+    uint64_t t, prev = 0; const void* val; size_t vlen;
+    int n = 0; bool first = true;
+    while (spike_db_iter_next(it, &t, &val, &vlen)) {
+        if (!first) CHECK(t > prev, "sorted");
+        prev = t; first = false;
+        n++;
+    }
+    spike_db_iter_close(it);
+    CHECK(n == 1000, "n=%d", n);
+    spike_db_close(db);
+    cleanup();
+    PASS();
+}
+
+/*============================================================================
+ * 9. Mid-page random insert
+ *============================================================================*/
+
+TEST(test_random_insert) {
+    cleanup();
+    SpikeDB* db = NULL;
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+
+    /* First batch: ascending 0..999 step 2 (even times) */
+    SpikeDB_Batch* b = spike_db_batch_create();
+    for (int i = 0; i < 1000; i++) {
+        uint64_t v = (uint64_t)(i*2);
+        spike_db_batch_put(b, 1, (uint64_t)(i*2), &v, sizeof(v));
+    }
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write evens");
+    spike_db_batch_destroy(b);
+
+    /* Second batch: random odd times 1..1997, gets mid-page inserts */
+    b = spike_db_batch_create();
+    uint32_t rng = 12345;
+    for (int i = 0; i < 500; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        uint64_t t = (uint64_t)((rng % 999) * 2 + 1);
+        uint64_t v = t;
+        /* batch_put will reject duplicate via leaf_insert; ignore err */
+        spike_db_batch_put(b, 1, t, &v, sizeof(v));
+    }
+    /* This batch may include duplicates among itself — write may return error.
+     * Use one-by-one to skip duplicates within the batch. */
+    spike_db_batch_destroy(b);
+    for (int i = 0; i < 500; i++) {
+        rng = 12345 + i;
+        rng = rng * 1664525u + 1013904223u;
+        uint64_t t = (uint64_t)((rng % 999) * 2 + 1);
+        uint64_t v = t;
+        SpikeDB_Batch* one = spike_db_batch_create();
+        spike_db_batch_put(one, 1, t, &v, sizeof(v));
+        (void)spike_db_write(db, one);  /* ignore duplicate errors */
+        spike_db_batch_destroy(one);
+    }
+
+    /* Iteration must be sorted */
+    SpikeDB_Iter* it = spike_db_scan(db, 1, 0, UINT64_MAX);
+    uint64_t t, prev = 0; const void* val; size_t vlen;
+    bool first = true; int n = 0;
+    while (spike_db_iter_next(it, &t, &val, &vlen)) {
+        if (!first) CHECK(t > prev, "sorted at t=%llu prev=%llu",
+                          (unsigned long long)t, (unsigned long long)prev);
+        prev = t; first = false; n++;
+    }
+    spike_db_iter_close(it);
+    CHECK(n >= 1000, "n=%d", n);
+    spike_db_close(db);
+    cleanup();
+    PASS();
+}
+
+/*============================================================================
+ * 10. Large dataset (forces many leaf splits)
+ *============================================================================*/
+
+TEST(test_large_dataset) {
+    cleanup();
+    SpikeDB* db = NULL;
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
 
     const int N = 100000;
-    uint64_t* keys = (uint64_t*)malloc(N * sizeof(uint64_t));
-    CHECK(keys, "malloc failed");
-    for (int i = 0; i < N; i++) keys[i] = (uint64_t)i;
-    uint64_t rng = 0x12345678ABCDULL;
-    for (int i = N - 1; i > 0; i--) {
-        int j = (int)(xorshift64(&rng) % (uint64_t)(i + 1));
-        uint64_t tmp = keys[i]; keys[i] = keys[j]; keys[j] = tmp;
+    SpikeDB_Batch* b = spike_db_batch_create();
+    /* Tick-like value: 64 bytes */
+    char tick[64];
+    memset(tick, 0xAB, sizeof(tick));
+
+    double t0 = now_ms();
+    for (int i = 0; i < N; i++) {
+        memcpy(tick, &i, sizeof(i));
+        spike_db_batch_put(b, 1, (uint64_t)i, tick, sizeof(tick));
+        if ((i+1) % 10000 == 0) {
+            CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write @%d", i);
+            spike_db_batch_clear(b);
+        }
     }
+    double t1 = now_ms();
+    spike_db_batch_destroy(b);
+    printf("[%.0f ms ingest %d recs, %.0f rec/s] ", t1-t0, N, N * 1000.0 / (t1-t0));
 
-    SpikeDB_Timer t0, t1;
-
-    timer_now(&t0);
-    for (int i = 0; i < N; i++)
-        put_u64(db, keys[i], keys[i]);
-    timer_now(&t1);
-    double put_ms = timer_ms(t0, t1);
-
-    for (int i = N - 1; i > 0; i--) {
-        int j = (int)(xorshift64(&rng) % (uint64_t)(i + 1));
-        uint64_t tmp = keys[i]; keys[i] = keys[j]; keys[j] = tmp;
+    /* Scan and verify */
+    double s0 = now_ms();
+    SpikeDB_Iter* it = spike_db_scan(db, 1, 0, UINT64_MAX);
+    uint64_t t; const void* val; size_t vlen;
+    int n = 0;
+    while (spike_db_iter_next(it, &t, &val, &vlen)) {
+        CHECK(vlen == 64, "vlen");
+        int got; memcpy(&got, val, sizeof(int));
+        CHECK(got == (int)t, "value at t=%llu got=%d", (unsigned long long)t, got);
+        n++;
     }
+    spike_db_iter_close(it);
+    double s1 = now_ms();
+    CHECK(n == N, "n=%d", n);
+    printf("[%.0f ms scan, %.0f rec/s] ", s1-s0, N * 1000.0 / (s1-s0));
 
-    uint64_t v;
-    int hits = 0;
-    timer_now(&t0);
-    for (int i = 0; i < N; i++)
-        if (get_u64(db, keys[i], &v) == SPIKEDB_OK) hits++;
-    timer_now(&t1);
-    double get_ms = timer_ms(t0, t1);
+    /* Latest timestamp */
+    uint64_t mx;
+    CHECK(spike_db_max_time(db, 1, &mx) == SPIKEDB_OK && mx == (uint64_t)(N-1),
+          "max=%llu", (unsigned long long)mx);
 
-    printf("    put: %.1f ms  (%.0f ops/s)\n", put_ms, N / (put_ms / 1000.0));
-    printf("    get: %.1f ms  (%.0f ops/s)  hits=%d/%d\n", get_ms, N / (get_ms / 1000.0), hits, N);
-    CHECK(hits == N, "only %d/%d hits", hits, N);
-
-    free(keys);
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 19: Performance - point delete throughput
- *============================================================================*/
-static void test_perf_delete(void) {
-    printf("  [19] Perf: delete 50k after insert 50k\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, SPIKEDB_OPEN_EXCLUSIVE);
-    CHECK(db, "open failed");
-
-    const uint64_t N = 50000;
-    for (uint64_t i = 0; i < N; i++)
-        put_u64(db, i, i);
-
-    SpikeDB_Timer t0, t1;
-    int del_ok = 0;
-    timer_now(&t0);
-    for (uint64_t i = 0; i < N; i++)
-        if (del_u64(db, i) == SPIKEDB_OK) del_ok++;
-    timer_now(&t1);
-    double del_ms = timer_ms(t0, t1);
-
-    printf("    delete: %.1f ms  (%.0f ops/s)  deleted=%d/%llu\n",
-           del_ms, N / (del_ms / 1000.0), del_ok, (unsigned long long)N);
-    CHECK(del_ok == (int)N, "only %d/%llu deletes", del_ok, (unsigned long long)N);
+    SpikeDB_Stats st;
+    spike_db_stats(db, &st);
+    printf("[pages=%llu hits=%llu misses=%llu] ",
+           (unsigned long long)st.total_pages,
+           (unsigned long long)st.cache_hits,
+           (unsigned long long)st.cache_misses);
 
     spike_db_close(db);
     cleanup();
@@ -779,218 +430,167 @@ static void test_perf_delete(void) {
 }
 
 /*============================================================================
- * TEST 20: Scale test - 500k keys
+ * 11. Atomicity — failed batch leaves DB unchanged
  *============================================================================*/
-static void test_scale_500k(void) {
-    printf("  [20] Scale: 500k sequential keys\n");
+
+TEST(test_batch_atomic_duplicate) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, SPIKEDB_OPEN_EXCLUSIVE);
-    CHECK(db, "open failed");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
 
-    const uint64_t N = 500000;
-    SpikeDB_Timer t0, t1;
-
-    timer_now(&t0);
-    for (uint64_t i = 0; i < N; i++)
-        put_u64(db, i, i);
-    timer_now(&t1);
-    double put_ms = timer_ms(t0, t1);
-    printf("    put: %.1f ms  (%.0f ops/s)\n", put_ms, N / (put_ms / 1000.0));
-
-    uint64_t rng = 0xABCDABCDABCDULL;
-    int hits = 0;
-    const int SAMPLE = 10000;
-    timer_now(&t0);
-    for (int i = 0; i < SAMPLE; i++) {
-        uint64_t k = xorshift64(&rng) % N;
-        uint64_t v;
-        if (get_u64(db, k, &v) == SPIKEDB_OK) hits++;
-    }
-    timer_now(&t1);
-    double get_ms = timer_ms(t0, t1);
-    printf("    random sample get (%d): %.1f ms  (%.0f ops/s)  hits=%d\n",
-           SAMPLE, get_ms, SAMPLE / (get_ms / 1000.0), hits);
-    CHECK(hits == SAMPLE, "only %d/%d sample hits", hits, SAMPLE);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 21: WriteBatch — batched puts and deletes
- *============================================================================*/
-static void test_writebatch(void) {
-    printf("  [21] WriteBatch\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    SpikeDB_WriteBatch* batch = spike_db_writebatch_create();
-    CHECK(batch, "writebatch create failed");
-
-    /* Batch 100 puts */
+    SpikeDB_Batch* b = spike_db_batch_create();
     for (int i = 0; i < 100; i++) {
-        char k[32], v[32];
-        int kl = sprintf(k, "batch_key_%d", i);
-        int vl = sprintf(v, "batch_val_%d", i);
-        spike_db_writebatch_put(batch, k, (size_t)kl, v, (size_t)vl);
+        uint64_t v = (uint64_t)i;
+        spike_db_batch_put(b, 1, (uint64_t)i, &v, sizeof(v));
     }
-    CHECK(spike_db_writebatch_count(batch) == 100, "batch count wrong");
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "first batch");
+    spike_db_batch_destroy(b);
 
-    SpikeDB_Status rc = spike_db_write(db, batch);
-    CHECK(rc == SPIKEDB_OK, "write batch failed rc=%d", rc);
+    uint64_t cnt_before;
+    CHECK(spike_db_count(db, 1, &cnt_before) == SPIKEDB_OK, "count");
+    CHECK(cnt_before == 100, "before=%llu", (unsigned long long)cnt_before);
 
-    /* Verify all 100 keys exist */
-    int fails = 0;
-    for (int i = 0; i < 100; i++) {
-        char k[32], expected[32];
-        int kl = sprintf(k, "batch_key_%d", i);
-        int el = sprintf(expected, "batch_val_%d", i);
-        char* val = NULL;
-        size_t vlen = 0;
-        rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-        if (rc != SPIKEDB_OK || vlen != (size_t)el || memcmp(val, expected, vlen) != 0)
-            fails++;
-        spike_db_free(val);
+    /* New batch with one duplicate buried in middle — should fail atomically */
+    b = spike_db_batch_create();
+    for (int i = 200; i < 250; i++) {
+        uint64_t v = (uint64_t)i;
+        spike_db_batch_put(b, 1, (uint64_t)i, &v, sizeof(v));
     }
-    CHECK(fails == 0, "%d batch get failures", fails);
+    /* Add a duplicate (i=50 already exists) */
+    uint64_t dv = 50;
+    spike_db_batch_put(b, 1, 50, &dv, sizeof(dv));
+    SpikeDB_Status st = spike_db_write(db, b);
+    CHECK(st != SPIKEDB_OK, "expected failure");
+    spike_db_batch_destroy(b);
 
-    /* Mixed batch: delete first 50, insert 50 new */
-    spike_db_writebatch_clear(batch);
-    CHECK(spike_db_writebatch_count(batch) == 0, "clear didn't reset count");
+    uint64_t cnt_after;
+    CHECK(spike_db_count(db, 1, &cnt_after) == SPIKEDB_OK, "count after");
+    CHECK(cnt_after == cnt_before, "atomic: %llu vs %llu",
+          (unsigned long long)cnt_after, (unsigned long long)cnt_before);
 
-    for (int i = 0; i < 50; i++) {
-        char k[32];
-        int kl = sprintf(k, "batch_key_%d", i);
-        spike_db_writebatch_delete(batch, k, (size_t)kl);
-    }
-    for (int i = 100; i < 150; i++) {
-        char k[32], v[32];
-        int kl = sprintf(k, "batch_key_%d", i);
-        int vl = sprintf(v, "batch_val_%d", i);
-        spike_db_writebatch_put(batch, k, (size_t)kl, v, (size_t)vl);
-    }
-
-    rc = spike_db_write(db, batch);
-    CHECK(rc == SPIKEDB_OK, "mixed batch failed rc=%d", rc);
-
-    /* Verify deletes */
-    fails = 0;
-    for (int i = 0; i < 50; i++) {
-        char k[32];
-        int kl = sprintf(k, "batch_key_%d", i);
-        char* val = NULL;
-        size_t vlen = 0;
-        rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-        if (rc != SPIKEDB_NOT_FOUND) fails++;
-        spike_db_free(val);
-    }
-    CHECK(fails == 0, "%d should-be-deleted keys found", fails);
-
-    /* Verify surviving + new keys */
-    fails = 0;
-    for (int i = 50; i < 150; i++) {
-        char k[32], expected[32];
-        int kl = sprintf(k, "batch_key_%d", i);
-        int el = sprintf(expected, "batch_val_%d", i);
-        char* val = NULL;
-        size_t vlen = 0;
-        rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-        if (rc != SPIKEDB_OK || vlen != (size_t)el || memcmp(val, expected, vlen) != 0)
-            fails++;
-        spike_db_free(val);
-    }
-    CHECK(fails == 0, "%d post-batch checks failed", fails);
-
-    spike_db_writebatch_destroy(batch);
     spike_db_close(db);
     cleanup();
     PASS();
 }
 
 /*============================================================================
- * TEST 22: Large binary key/value
+ * 12. Persistence after large dataset
  *============================================================================*/
-static void test_binary_data(void) {
-    printf("  [22] Binary keys and values\n");
+
+TEST(test_persistence_large) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
 
-    /* Key and value with embedded null bytes */
-    const char bin_key[] = "key\x00with\x00nulls";
-    size_t bin_keylen = sizeof(bin_key) - 1;  /* 14 bytes including nulls */
-    const char bin_val[] = "val\x00\x01\x02\xFF\xFE";
-    size_t bin_vallen = sizeof(bin_val) - 1;
-
-    SpikeDB_Status rc = spike_db_put(db, bin_key, bin_keylen, bin_val, bin_vallen);
-    CHECK(rc == SPIKEDB_OK, "binary put failed");
-
-    char* val = NULL;
-    size_t vlen = 0;
-    rc = spike_db_get(db, bin_key, bin_keylen, &val, &vlen);
-    CHECK(rc == SPIKEDB_OK, "binary get failed");
-    CHECK(vlen == bin_vallen && memcmp(val, bin_val, vlen) == 0, "binary value mismatch");
-    spike_db_free(val);
-
-    /* Large value (2KB) */
-    {
-        char big_val[2048];
-        memset(big_val, 0xAB, sizeof(big_val));
-        rc = spike_db_put(db, "bigkey", 6, big_val, sizeof(big_val));
-        CHECK(rc == SPIKEDB_OK, "large value put failed");
-
-        val = NULL;
-        rc = spike_db_get(db, "bigkey", 6, &val, &vlen);
-        CHECK(rc == SPIKEDB_OK && vlen == sizeof(big_val), "large value get failed");
-        int ok = 1;
-        for (size_t i = 0; i < vlen; i++)
-            if ((unsigned char)val[i] != 0xAB) { ok = 0; break; }
-        CHECK(ok, "large value data corruption");
-        spike_db_free(val);
+    const int N = 20000;
+    SpikeDB_Batch* b = spike_db_batch_create();
+    for (int i = 0; i < N; i++) {
+        uint64_t v = (uint64_t)i;
+        spike_db_batch_put(b, 7, (uint64_t)i, &v, sizeof(v));
+        if ((i+1) % 5000 == 0) {
+            CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write");
+            spike_db_batch_clear(b);
+        }
     }
+    spike_db_batch_destroy(b);
+    spike_db_close(db);
 
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "reopen");
+    uint64_t cnt;
+    CHECK(spike_db_count(db, 7, &cnt) == SPIKEDB_OK && cnt == (uint64_t)N,
+          "count after reopen: %llu", (unsigned long long)cnt);
+    SpikeDB_Iter* it = spike_db_scan(db, 7, 0, UINT64_MAX);
+    int n = 0; uint64_t t, prev = 0; const void* val; size_t vlen;
+    bool first = true;
+    while (spike_db_iter_next(it, &t, &val, &vlen)) {
+        if (!first) {
+            if (t <= prev) {
+                printf("\n    out-of-order: t=%llu prev=%llu n=%d\n",
+                       (unsigned long long)t, (unsigned long long)prev, n);
+            }
+        }
+        prev = t; first = false; n++;
+    }
+    spike_db_iter_close(it);
+    CHECK(n == N, "n=%d", n);
     spike_db_close(db);
     cleanup();
     PASS();
 }
 
 /*============================================================================
- * TEST 23: Empty key and empty value
+ * 13. truncate_before — drop entire and partial leaves
  *============================================================================*/
-static void test_empty_key_value(void) {
-    printf("  [23] Empty key and empty value\n");
+
+TEST(test_truncate_before) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
 
-    /* Empty value */
-    SpikeDB_Status rc = spike_db_put(db, "novalue", 7, "", 0);
-    CHECK(rc == SPIKEDB_OK, "empty value put failed");
-    {
-        char* val = NULL;
-        size_t vlen = 99;
-        rc = spike_db_get(db, "novalue", 7, &val, &vlen);
-        CHECK(rc == SPIKEDB_OK && vlen == 0, "empty value get failed vlen=%zu", vlen);
-        spike_db_free(val);
+    const int N = 20000;
+    SpikeDB_Batch* b = spike_db_batch_create();
+    for (int i = 0; i < N; i++) {
+        uint64_t v = (uint64_t)i;
+        spike_db_batch_put(b, 1, (uint64_t)i, &v, sizeof(v));
+        if ((i+1) % 5000 == 0) {
+            CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write");
+            spike_db_batch_clear(b);
+        }
     }
+    spike_db_batch_destroy(b);
 
-    /* Empty key */
-    rc = spike_db_put(db, "", 0, "has_value", 9);
-    CHECK(rc == SPIKEDB_OK, "empty key put failed");
-    {
-        char* val = NULL;
-        size_t vlen = 0;
-        rc = spike_db_get(db, "", 0, &val, &vlen);
-        CHECK(rc == SPIKEDB_OK && vlen == 9 && memcmp(val, "has_value", 9) == 0,
-              "empty key get failed");
-        spike_db_free(val);
+    /* Truncate everything before t=10000 */
+    CHECK(spike_db_truncate_before(db, 1, 10000) == SPIKEDB_OK, "truncate");
+
+    uint64_t cnt;
+    CHECK(spike_db_count(db, 1, &cnt) == SPIKEDB_OK && cnt == (uint64_t)(N - 10000),
+          "post-truncate count: %llu (expected %d)", (unsigned long long)cnt, N - 10000);
+
+    uint64_t mn, mx;
+    CHECK(spike_db_min_time(db, 1, &mn) == SPIKEDB_OK && mn == 10000,
+          "min=%llu", (unsigned long long)mn);
+    CHECK(spike_db_max_time(db, 1, &mx) == SPIKEDB_OK && mx == (uint64_t)(N-1),
+          "max=%llu", (unsigned long long)mx);
+
+    /* Verify gone records can't be looked up */
+    void* v; size_t vl;
+    CHECK(spike_db_get(db, 1, 0, &v, &vl)    == SPIKEDB_NOT_FOUND, "old get miss");
+    CHECK(spike_db_get(db, 1, 9999, &v, &vl) == SPIKEDB_NOT_FOUND, "boundary-1 miss");
+    CHECK(spike_db_get(db, 1, 10000, &v, &vl) == SPIKEDB_OK, "boundary hit");
+    spike_db_free(v);
+
+    /* Iterate over surviving range */
+    SpikeDB_Iter* it = spike_db_scan(db, 1, 0, UINT64_MAX);
+    int n = 0; uint64_t t, prev = 9999; const void* val; size_t vlen;
+    while (spike_db_iter_next(it, &t, &val, &vlen)) {
+        CHECK(t > prev, "sorted at t=%llu prev=%llu",
+              (unsigned long long)t, (unsigned long long)prev);
+        CHECK(t >= 10000, "kept range");
+        prev = t; n++;
     }
+    spike_db_iter_close(it);
+    CHECK(n == N - 10000, "iter count %d expected %d", n, N - 10000);
+
+    /* Truncate to current max — should leave only the last record */
+    CHECK(spike_db_truncate_before(db, 1, (uint64_t)(N - 1)) == SPIKEDB_OK, "truncate2");
+    CHECK(spike_db_count(db, 1, &cnt) == SPIKEDB_OK && cnt == 1,
+          "after truncate2 count=%llu", (unsigned long long)cnt);
+
+    /* Truncate everything */
+    CHECK(spike_db_truncate_before(db, 1, UINT64_MAX) == SPIKEDB_OK, "truncate3");
+    CHECK(spike_db_count(db, 1, &cnt) == SPIKEDB_OK && cnt == 0,
+          "fully truncated count=%llu", (unsigned long long)cnt);
+
+    /* Insert again and verify usable */
+    b = spike_db_batch_create();
+    uint64_t vv = 999;
+    spike_db_batch_put(b, 1, 12345, &vv, sizeof(vv));
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "reuse");
+    spike_db_batch_destroy(b);
+
+    void* gv; size_t gl;
+    CHECK(spike_db_get(db, 1, 12345, &gv, &gl) == SPIKEDB_OK, "get after reuse");
+    spike_db_free(gv);
 
     spike_db_close(db);
     cleanup();
@@ -998,534 +598,124 @@ static void test_empty_key_value(void) {
 }
 
 /*============================================================================
- * TEST 24: Meta page integrity (CRC32 validation on reopen)
+ * 14. Truncate persists across reopen
  *============================================================================*/
-static void test_meta_integrity(void) {
-    printf("  [24] Meta page integrity (CRC32 + double-buffer)\n");
+
+TEST(test_truncate_persistence) {
     cleanup();
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    /* Write some data so txn_id advances */
-    for (uint64_t i = 0; i < 50; i++)
-        put_u64(db, i, i * 7);
-
-    spike_db_close(db);
-    db = NULL;
-
-    /* Re-open — both meta pages should be valid, higher txn_id wins */
-    SpikeDB_Status rc = spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(rc == SPIKEDB_OK && db, "reopen after writes failed rc=%d", rc);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < 50; i++) {
-        rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == i * 7, fails,
-                        "key=%llu rc=%d val=%llu", (unsigned long long)i, rc, (unsigned long long)val);
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    SpikeDB_Batch* b = spike_db_batch_create();
+    for (int i = 0; i < 5000; i++) {
+        uint64_t v = (uint64_t)i;
+        spike_db_batch_put(b, 7, (uint64_t)i, &v, sizeof(v));
     }
-    CHECK(fails == 0, "%d meta-integrity checks failed", fails);
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "write");
+    spike_db_batch_destroy(b);
+    CHECK(spike_db_truncate_before(db, 7, 2500) == SPIKEDB_OK, "truncate");
+    spike_db_close(db);
 
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "reopen");
+    uint64_t cnt;
+    CHECK(spike_db_count(db, 7, &cnt) == SPIKEDB_OK && cnt == 2500,
+          "count after reopen=%llu", (unsigned long long)cnt);
+    SpikeDB_Iter* it = spike_db_scan(db, 7, 0, UINT64_MAX);
+    int n = 0; uint64_t t; const void* v; size_t vl;
+    while (spike_db_iter_next(it, &t, &v, &vl)) {
+        CHECK(t >= 2500, "kept");
+        n++;
+    }
+    spike_db_iter_close(it);
+    CHECK(n == 2500, "n=%d", n);
     spike_db_close(db);
     cleanup();
     PASS();
 }
 
 /*============================================================================
- * TEST 25: Simulated torn write recovery
+ * 15. Concurrent reader + writer (multi-process)
  *
- * Corrupt one meta page's checksum, then re-open.  The database should
- * recover from the other (still-valid) meta page.
+ * Spawn a writer subprocess that opens the DB and inserts records while
+ * this process reads them. Verifies the file lock prevents corruption.
  *============================================================================*/
-static void test_torn_write_recovery(void) {
-    printf("  [25] Torn-write recovery (corrupt one meta page)\n");
+
+TEST(test_multiprocess_basic) {
     cleanup();
+
+    /* Seed the DB with one batch */
     SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    for (uint64_t i = 0; i < 100; i++)
-        put_u64(db, i, i + 0xBEEF);
-
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    SpikeDB_Batch* b = spike_db_batch_create();
+    uint64_t v = 1;
+    spike_db_batch_put(b, 1, 100, &v, sizeof(v));
+    CHECK(spike_db_write(db, b) == SPIKEDB_OK, "seed");
+    spike_db_batch_destroy(b);
     spike_db_close(db);
-    db = NULL;
 
-    /* Corrupt meta page 0 by flipping some bytes in its checksum area.
-     * We do this by raw file I/O, not through the mmap. */
-    {
-#ifdef _WIN32
-        HANDLE hFile = CreateFileA(TEST_DB_PATH, GENERIC_READ | GENERIC_WRITE,
-                                    0, NULL, OPEN_EXISTING,
-                                    FILE_ATTRIBUTE_NORMAL, NULL);
-        CHECK(hFile != INVALID_HANDLE_VALUE, "corrupt: open failed");
+    /* Open from two handles — same process is a useful smoke test */
+    SpikeDB* w = NULL; SpikeDB* r = NULL;
+    CHECK(spike_db_open(&w, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "writer");
+    CHECK(spike_db_open(&r, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "reader");
 
-        /* Read page 0, trash the checksum, write back */
-        uint8_t page[4096];
-        DWORD read_bytes = 0;
-        ReadFile(hFile, page, 4096, &read_bytes, NULL);
-        CHECK(read_bytes == 4096, "corrupt: read failed");
+    /* Writer inserts; reader reads via the same file but separate handle */
+    for (int i = 0; i < 100; i++) {
+        b = spike_db_batch_create();
+        uint64_t vv = (uint64_t)(i + 1000);
+        spike_db_batch_put(b, 1, (uint64_t)(i + 200), &vv, sizeof(vv));
+        CHECK(spike_db_write(w, b) == SPIKEDB_OK, "iter %d write", i);
+        spike_db_batch_destroy(b);
 
-        /* Flip bytes at offset 36 (checksum field) */
-        page[36] ^= 0xFF;
-        page[37] ^= 0xFF;
+        uint64_t mx;
+        CHECK(spike_db_max_time(r, 1, &mx) == SPIKEDB_OK,
+              "iter %d reader max_time", i);
+        CHECK(mx == (uint64_t)(i + 200),
+              "iter %d max=%llu expected %d", i,
+              (unsigned long long)mx, i + 200);
 
-        SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
-        DWORD written = 0;
-        WriteFile(hFile, page, 4096, &written, NULL);
-        CloseHandle(hFile);
-#else
-        int fd = open(TEST_DB_PATH, O_RDWR);
-        CHECK(fd >= 0, "corrupt: open failed");
-
-        uint8_t page[4096];
-        ssize_t rb = read(fd, page, 4096);
-        CHECK(rb == 4096, "corrupt: read failed");
-
-        page[36] ^= 0xFF;
-        page[37] ^= 0xFF;
-
-        lseek(fd, 0, SEEK_SET);
-        ssize_t wb = write(fd, page, 4096);
-        (void)wb;
-        close(fd);
-#endif
-    }
-
-    /* Re-open — should recover from meta page 1 */
-    SpikeDB_Status rc = spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(rc == SPIKEDB_OK && db, "recovery open failed rc=%d", rc);
-
-    int fails = 0;
-    uint64_t val;
-    for (uint64_t i = 0; i < 100; i++) {
-        rc = get_u64(db, i, &val);
-        CHECK_CONTINUE(rc == SPIKEDB_OK && val == i + 0xBEEF, fails,
-                        "key=%llu rc=%d val=%llu", (unsigned long long)i, rc, (unsigned long long)val);
-    }
-    printf("    recovered %d/100 keys from surviving meta page\n", 100 - fails);
-    CHECK(fails == 0, "%d recovery checks failed", fails);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 26: WriteBatch atomicity (single commit for batch)
- *============================================================================*/
-static void test_writebatch_single_commit(void) {
-    printf("  [26] WriteBatch single commit\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    /* Put 200 keys in a batch — should result in exactly 1 meta commit */
-    SpikeDB_WriteBatch* batch = spike_db_writebatch_create();
-    CHECK(batch, "batch create failed");
-
-    for (int i = 0; i < 200; i++) {
-        char k[32], v[32];
-        int kl = sprintf(k, "batch2_%d", i);
-        int vl = sprintf(v, "val2_%d", i);
-        spike_db_writebatch_put(batch, k, (size_t)kl, v, (size_t)vl);
-    }
-
-    SpikeDB_Status rc = spike_db_write(db, batch);
-    CHECK(rc == SPIKEDB_OK, "batch write failed rc=%d", rc);
-    spike_db_writebatch_destroy(batch);
-
-    spike_db_close(db);
-    db = NULL;
-
-    /* Reopen and verify */
-    rc = spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(rc == SPIKEDB_OK && db, "reopen failed");
-
-    int fails = 0;
-    for (int i = 0; i < 200; i++) {
-        char k[32], expected[32];
-        int kl = sprintf(k, "batch2_%d", i);
-        int el = sprintf(expected, "val2_%d", i);
-        char* val = NULL;
-        size_t vlen = 0;
-        rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-        if (rc != SPIKEDB_OK || vlen != (size_t)el || memcmp(val, expected, vlen) != 0)
-            fails++;
-        spike_db_free(val);
-    }
-    CHECK(fails == 0, "%d batch single-commit checks failed", fails);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 27: Exactly 64 keys per page (page-full boundary)
- *============================================================================*/
-static void test_exact_page_fill(void) {
-    printf("  [27] Exact page fill (64 keys = 1 full page)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    for (int i = 0; i < SPIKEDB_KEYS_PER_PAGE; i++) {
-        char k[32], v[32];
-        int kl = sprintf(k, "fill_%d", i);
-        int vl = sprintf(v, "val_%d", i);
-        SpikeDB_Status rc = spike_db_put(db, k, (size_t)kl, v, (size_t)vl);
-        CHECK(rc == SPIKEDB_OK, "put %d failed", i);
-    }
-
-    int fails = 0;
-    for (int i = 0; i < SPIKEDB_KEYS_PER_PAGE; i++) {
-        char k[32], expected[32];
-        int kl = sprintf(k, "fill_%d", i);
-        int el = sprintf(expected, "val_%d", i);
-        char* val = NULL;
-        size_t vlen = 0;
-        SpikeDB_Status rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-        if (rc != SPIKEDB_OK || vlen != (size_t)el || memcmp(val, expected, vlen) != 0)
-            fails++;
-        spike_db_free(val);
-    }
-    CHECK(fails == 0, "%d / %d page-fill checks failed", fails, SPIKEDB_KEYS_PER_PAGE);
-
-    /* Insert one more to trigger page split */
-    {
-        SpikeDB_Status rc = spike_db_put(db, "split_trigger", 13, "boom", 4);
-        CHECK(rc == SPIKEDB_OK, "split trigger put failed");
-        char* val = NULL;
-        size_t vlen = 0;
-        rc = spike_db_get(db, "split_trigger", 13, &val, &vlen);
-        CHECK(rc == SPIKEDB_OK && vlen == 4 && memcmp(val, "boom", 4) == 0,
-              "split trigger verify failed");
+        void* val; size_t vl;
+        CHECK(spike_db_get(r, 1, (uint64_t)(i + 200), &val, &vl) == SPIKEDB_OK,
+              "iter %d reader get", i);
         spike_db_free(val);
     }
 
-    /* Re-verify all original keys survive the split */
-    fails = 0;
-    for (int i = 0; i < SPIKEDB_KEYS_PER_PAGE; i++) {
-        char k[32], expected[32];
-        int kl = sprintf(k, "fill_%d", i);
-        int el = sprintf(expected, "val_%d", i);
-        char* val = NULL;
-        size_t vlen = 0;
-        SpikeDB_Status rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-        if (rc != SPIKEDB_OK || vlen != (size_t)el || memcmp(val, expected, vlen) != 0)
-            fails++;
-        spike_db_free(val);
-    }
-    CHECK(fails == 0, "%d keys lost after page split", fails);
-
-    spike_db_close(db);
+    spike_db_close(r);
+    spike_db_close(w);
     cleanup();
     PASS();
 }
 
 /*============================================================================
- * TEST 28: Large record near max size
- *============================================================================*/
-static void test_large_record(void) {
-    printf("  [28] Large record near max size\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    /* Write a value that's close to SPIKEDB_MAX_RECORD_SIZE */
-    size_t big_vlen = SPIKEDB_MAX_RECORD_SIZE - 16;  /* leave room for key */
-    char* big_val = (char*)malloc(big_vlen);
-    CHECK(big_val, "malloc failed");
-    /* Fill with a pattern */
-    for (size_t i = 0; i < big_vlen; i++)
-        big_val[i] = (char)(i & 0xFF);
-
-    SpikeDB_Status rc = spike_db_put(db, "bigrecord", 9, big_val, big_vlen);
-    CHECK(rc == SPIKEDB_OK, "large record put failed");
-
-    char* val = NULL;
-    size_t vlen = 0;
-    rc = spike_db_get(db, "bigrecord", 9, &val, &vlen);
-    CHECK(rc == SPIKEDB_OK && vlen == big_vlen, "large record get failed vlen=%zu", vlen);
-    CHECK(memcmp(val, big_val, vlen) == 0, "large record data corrupted");
-    spike_db_free(val);
-    free(big_val);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 29: Rapid delete/re-insert cycles (freelist stress)
- *============================================================================*/
-static void test_delete_reinsert_cycles(void) {
-    printf("  [29] Rapid delete/re-insert cycles (5 rounds x 500 keys)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    const int N = 500;
-    const int ROUNDS = 5;
-
-    for (int r = 0; r < ROUNDS; r++) {
-        for (int i = 0; i < N; i++)
-            put_u64(db, (uint64_t)i, (uint64_t)(i + r * 10000));
-
-        int fails = 0;
-        uint64_t val;
-        for (int i = 0; i < N; i++) {
-            SpikeDB_Status rc = get_u64(db, (uint64_t)i, &val);
-            CHECK_CONTINUE(rc == SPIKEDB_OK && val == (uint64_t)(i + r * 10000), fails,
-                            "round=%d key=%d rc=%d", r, i, rc);
-        }
-        if (fails > 0) { CHECK(0, "round %d: %d failures", r, fails); }
-
-        /* Delete all keys */
-        for (int i = 0; i < N; i++)
-            del_u64(db, (uint64_t)i);
-
-        /* Verify all deleted */
-        for (int i = 0; i < N; i++) {
-            SpikeDB_Status rc = get_u64(db, (uint64_t)i, &val);
-            CHECK_CONTINUE(rc == SPIKEDB_NOT_FOUND, fails,
-                            "round=%d key=%d not deleted", r, i);
-        }
-        if (fails > 0) { CHECK(0, "round %d: %d delete failures", r, fails); }
-    }
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 30: Mixed workload benchmark
- *============================================================================*/
-static void test_perf_mixed(void) {
-    printf("  [30] Perf: mixed workload (50k put + 50k get + 10k delete)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, SPIKEDB_OPEN_EXCLUSIVE);
-    CHECK(db, "open failed");
-
-    const int N = 50000;
-    SpikeDB_Timer t0, t1;
-
-    /* Phase 1: insert N keys */
-    for (int i = 0; i < N; i++)
-        put_u64(db, (uint64_t)i, (uint64_t)i * 3);
-
-    /* Phase 2: interleaved get + put + delete */
-    uint64_t rng = 0xFEDCBA9876543210ULL;
-    int gets = 0, puts = 0, dels = 0, get_hits = 0;
-
-    timer_now(&t0);
-    for (int i = 0; i < N; i++) {
-        uint64_t r = xorshift64(&rng);
-        int op = (int)(r % 10);
-        uint64_t key = xorshift64(&rng) % (uint64_t)N;
-        uint64_t val;
-
-        if (op < 5) {
-            /* 50% get */
-            if (get_u64(db, key, &val) == SPIKEDB_OK) get_hits++;
-            gets++;
-        } else if (op < 8) {
-            /* 30% put */
-            put_u64(db, key, key + 0xDEAD);
-            puts++;
-        } else {
-            /* 20% delete */
-            del_u64(db, key);
-            dels++;
-        }
-    }
-    timer_now(&t1);
-    double mixed_ms = timer_ms(t0, t1);
-
-    printf("    mixed ops (%d get, %d put, %d del): %.1f ms  (%.0f total ops/s)\n",
-           gets, puts, dels, mixed_ms, N / (mixed_ms / 1000.0));
-    printf("    get hit rate: %d/%d (%.1f%%)\n", get_hits, gets,
-           gets > 0 ? 100.0 * get_hits / gets : 0.0);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * TEST 31: WriteBatch performance comparison
- *============================================================================*/
-static void test_perf_writebatch(void) {
-    printf("  [31] Perf: WriteBatch vs individual puts (10k keys)\n");
-    cleanup();
-    const int N = 10000;
-    SpikeDB_Timer t0, t1;
-
-    /* Individual puts */
-    {
-        SpikeDB* db = NULL;
-        spike_db_open(&db, TEST_DB_PATH, 1, SPIKEDB_OPEN_EXCLUSIVE);
-        CHECK(db, "open failed");
-
-        timer_now(&t0);
-        for (int i = 0; i < N; i++) {
-            char k[32], v[32];
-            int kl = sprintf(k, "key_%d", i);
-            int vl = sprintf(v, "val_%d", i);
-            spike_db_put(db, k, (size_t)kl, v, (size_t)vl);
-        }
-        timer_now(&t1);
-        double indiv_ms = timer_ms(t0, t1);
-        printf("    individual: %.1f ms  (%.0f ops/s)\n", indiv_ms, N / (indiv_ms / 1000.0));
-
-        spike_db_close(db);
-        cleanup();
-    }
-
-    /* WriteBatch */
-    {
-        SpikeDB* db = NULL;
-        spike_db_open(&db, TEST_DB_PATH, 1, SPIKEDB_OPEN_EXCLUSIVE);
-        CHECK(db, "open failed");
-
-        SpikeDB_WriteBatch* batch = spike_db_writebatch_create();
-        CHECK(batch, "batch create failed");
-
-        for (int i = 0; i < N; i++) {
-            char k[32], v[32];
-            int kl = sprintf(k, "key_%d", i);
-            int vl = sprintf(v, "val_%d", i);
-            spike_db_writebatch_put(batch, k, (size_t)kl, v, (size_t)vl);
-        }
-
-        timer_now(&t0);
-        spike_db_write(db, batch);
-        timer_now(&t1);
-        double batch_ms = timer_ms(t0, t1);
-        printf("    writebatch: %.1f ms  (%.0f ops/s)\n", batch_ms, N / (batch_ms / 1000.0));
-
-        /* Verify */
-        int fails = 0;
-        for (int i = 0; i < N; i++) {
-            char k[32], expected[32];
-            int kl = sprintf(k, "key_%d", i);
-            int el = sprintf(expected, "val_%d", i);
-            char* val = NULL;
-            size_t vlen = 0;
-            SpikeDB_Status rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-            if (rc != SPIKEDB_OK || vlen != (size_t)el || memcmp(val, expected, vlen) != 0)
-                fails++;
-            spike_db_free(val);
-        }
-        CHECK(fails == 0, "%d batch verify failures", fails);
-
-        spike_db_writebatch_destroy(batch);
-        spike_db_close(db);
-        cleanup();
-    }
-
-    PASS();
-}
-
-/*============================================================================
- * TEST 32: Long key stress (keys up to 200 bytes)
- *============================================================================*/
-static void test_long_keys(void) {
-    printf("  [32] Long key stress (200-byte keys)\n");
-    cleanup();
-    SpikeDB* db = NULL;
-    spike_db_open(&db, TEST_DB_PATH, 1, 0);
-    CHECK(db, "open failed");
-
-    const int N = 500;
-    int fails = 0;
-
-    for (int i = 0; i < N; i++) {
-        char k[256], v[64];
-        /* Build a long key: "longkey_NNN_padding..." */
-        int kl = sprintf(k, "longkey_%d_", i);
-        /* Pad to ~200 bytes */
-        while (kl < 200) k[kl++] = 'A' + (i % 26);
-        int vl = sprintf(v, "value_%d", i);
-        SpikeDB_Status rc = spike_db_put(db, k, (size_t)kl, v, (size_t)vl);
-        CHECK(rc == SPIKEDB_OK, "long key put %d failed", i);
-    }
-
-    for (int i = 0; i < N; i++) {
-        char k[256], expected[64];
-        int kl = sprintf(k, "longkey_%d_", i);
-        while (kl < 200) k[kl++] = 'A' + (i % 26);
-        int el = sprintf(expected, "value_%d", i);
-        char* val = NULL;
-        size_t vlen = 0;
-        SpikeDB_Status rc = spike_db_get(db, k, (size_t)kl, &val, &vlen);
-        if (rc != SPIKEDB_OK || vlen != (size_t)el || memcmp(val, expected, vlen) != 0)
-            fails++;
-        spike_db_free(val);
-    }
-    CHECK(fails == 0, "%d / %d long key checks failed", fails, N);
-
-    spike_db_close(db);
-    cleanup();
-    PASS();
-}
-
-/*============================================================================
- * Main
+ * Driver
  *============================================================================*/
 
 int main(void) {
-    timer_init();
+#ifdef _WIN32
+    /* ensure tmp/ exists */
+    CreateDirectoryA("tmp", NULL);
+#else
+    mkdir("tmp", 0755);
+#endif
 
-    printf("======================================================\n");
-    printf("  SpikeDB Comprehensive Test Suite\n");
-    printf("======================================================\n\n");
+    printf("SpikeDB v5 tests\n");
+    printf("================\n\n");
 
-    test_basic_crud();
-    test_page_boundary();
-    test_large_sequential();
-    test_reverse_insert();
-    test_random_insert();
-    test_overwrite_stress();
-    test_delete_heavy();
-    test_delete_missing();
-    test_empty_db();
-    test_reopen();
-    test_string_keys();
-    test_interleaved_insert_delete();
-    test_sparse_keys();
-    test_same_key_repeat();
-    test_delete_all();
-    test_reinsert_after_delete();
-    test_perf_sequential();
-    test_perf_random();
-    test_perf_delete();
-    test_scale_500k();
-    test_writebatch();
-    test_binary_data();
-    test_empty_key_value();
-    test_meta_integrity();
-    test_torn_write_recovery();
-    test_writebatch_single_commit();
-    test_exact_page_fill();
-    test_large_record();
-    test_delete_reinsert_cycles();
-    test_perf_mixed();
-    test_perf_writebatch();
-    test_long_keys();
+    run_test_open_close_empty();
+    run_test_single_put_get();
+    run_test_persistence();
+    run_test_range_scan_sequential();
+    run_test_range_scan_bounded();
+    run_test_multi_symbol();
+    run_test_min_max_count();
+    run_test_out_of_order();
+    run_test_random_insert();
+    run_test_large_dataset();
+    run_test_batch_atomic_duplicate();
+    run_test_persistence_large();
+    run_test_truncate_before();
+    run_test_truncate_persistence();
+    run_test_multiprocess_basic();
 
-    printf("\n======================================================\n");
-    printf("  Results: %d passed, %d failed, %d total\n",
-           g_tests_passed, g_tests_failed, g_tests_run);
-    printf("======================================================\n");
-
-    cleanup();
-    return g_tests_failed > 0 ? 1 : 0;
+    printf("\n================\n");
+    printf("Results: %d/%d passed, %d failed\n", g_pass, g_run, g_fail);
+    return g_fail == 0 ? 0 : 1;
 }

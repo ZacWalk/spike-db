@@ -1,174 +1,332 @@
 # SpikeDB
 
-A single-file, SIMD-accelerated key-value store built on a disk-backed skip list with LMDB-inspired crash safety.  Supports variable-length byte keys and values with a RocksDB-style API.
+[![CI](https://github.com/ZacWalk/spike-db/actions/workflows/ci.yml/badge.svg)](https://github.com/ZacWalk/spike-db/actions/workflows/ci.yml)
 
-## Purpose
 
-SpikeDB is an embedded KV engine designed for workloads where read throughput and low-latency lookups matter most. It stores everything in a single memory-mapped sparse file, avoiding the complexity of LSM-tree compaction or multi-file B-tree management.
+A single-file, embeddable, append-dominant time-series store for financial
+market data. Composite primary key `(symbol_u64, time_u64)`, sorted by
+`time` within each `symbol`. Designed for one ingester process and many
+concurrent reader processes (bots, training jobs, dashboards).
 
-## Approach
+> Status: pre-1.0. API stable in shape; on-disk format may still change
+> until v1.0.
 
-### Single Sparse File
+---
 
-The database is a single file created as a **sparse file** and mapped entirely into the process's virtual address space via `CreateFileMapping`. The OS only allocates physical disk pages that are actually written to, so a 1 TB virtual extent costs nothing until data arrives.
+## Why SpikeDB?
 
-### Page-Based Layout (v3)
+Financial tick / candle data has a very specific shape that general-purpose
+KV stores handle poorly:
 
-The file is divided into fixed **4 KB pages**:
+- **Two-part composite key.** Every record is `(symbol, time)` and the
+  natural query is "give me all of `BTCUSDT` between `t0` and `t1`."
+- **Append-dominant, mostly time-ordered.** Live ticks arrive nearly sorted
+  but can occasionally land out of order (network reordering, late fills).
+- **One writer, many readers.** A single ingester writes; many bots and
+  training pipelines stream the same data concurrently from other
+  processes — sometimes hours-long range scans.
+- **"Anything new since X?"** Every bot polls "what is the latest tick I
+  have?" thousands of times per second. This must be effectively free.
+- **Massive files.** Per-symbol per-year tick volumes run
+  into hundreds of GB. Memory-mapping is not an option — it would either
+  thrash the page cache or limit the file to RAM.
 
-| Page Range | Role |
-|------------|------|
-| **Page 0** | Meta Page A — double-buffered root state with CRC32 checksum |
-| **Page 1** | Meta Page B — alternate meta page for crash-safe commits |
-| **Pages 2-3** | Reader Table — shared mmap slots for multi-process reader coordination |
-| **Pages 4+** | Skip Pages and Data Pages |
+SpikeDB is built around these constraints:
 
-Internal references use **32-bit Page IDs** instead of 64-bit pointers, doubling the density of routing metadata in SIMD registers.
+| Property                                          | Why it matters |
+|---------------------------------------------------|----------------|
+| Composite `(symbol, time)` key                    | No string parsing on every lookup; one `uint64_t` compare per level |
+| One skip list of leaves **per symbol**            | Symbols are isolated; scans never traverse other symbols' data |
+| 64 KB pages, sorted records, doubly-linked        | A single skip-list descent positions the iterator; it then walks `next_leaf` until done — close to memcpy speed |
+| Atomic batch writes (CoW + double-buffered meta)  | Crash-safe without a WAL; the ingester restarts cleanly mid-batch |
+| `spike_db_max_time(symbol)` is one cached page    | Bots poll latest-timestamp for free |
+| OS file range locks                               | Multiple processes coexist; readers block only during the writer's commit |
+| No mmap; page cache with `pread`/`ReadFile`       | Files can grow far beyond RAM |
+| `spike_db_truncate_before(symbol, t)`             | Easy retention — drop yesterday's ticks atomically |
 
-### Hash-Indexed Skip List
+**Initial use case:** ingest live exchange tick streams into a single file,
+train models off the same file across multiple processes, then run live
+strategies against a continuously-updated copy in production.
 
-Variable-length keys are hashed to `uint64_t` using a wyhash-inspired hash function.  The 64-bit hashes are stored in Skip Pages for SIMD-accelerated searching.  The actual key and value data is stored separately in Data Pages, referenced by encoded offsets.
+---
 
-On lookup:
-1. Hash the search key to `uint64_t`.
-2. Descend the skip list using hash-based routing.
-3. SIMD-scan the hash array for matches.
-4. For each hash match, verify the real key via `memcmp` (handles hash collisions).
-
-This design keeps the SIMD fast path (Bloom check + hash scan) operating on dense `uint64_t` arrays while supporting arbitrary-length keys.
-
-### SIMD Acceleration (Runtime Dispatch)
-
-Three code paths are compiled into every binary. At `spike_db_open()`, CPUID selects the fastest tier available on the running CPU:
-
-| Tier | Register width | Hashes per compare | Bloom filter check |
-|------|---------------|-------------------|--------------------|
-| **AVX-512** | 512-bit (ZMM) | 8 × 64-bit | Single `_mm512_cmpeq_epi64_mask` |
-| **AVX2** | 256-bit (YMM) | 4 × 64-bit | Two-half `_mm256_testz` |
-| **Scalar** | 64-bit | 1 × 64-bit | Loop over 8 words |
-
-The dispatch is done via a function-pointer table (`SpikeDB_SimdOps`) stored in the database handle — zero per-call branching overhead.
-
-### SIMD Block Bloom Filter
-
-Each page embeds a **64-byte Bloom filter** (one CPU cache line). Before scanning a page's hash array, the filter is checked with a single vectorised operation. A definite-miss result skips the page entirely, avoiding unnecessary memory-mapped I/O faults.
-
-### Crash Safety (LMDB-Inspired)
-
-SpikeDB v3 uses an LMDB-inspired **double-buffered meta page** strategy for crash-safe commits:
-
-1. **Two meta pages** (pages 0 and 1) each hold a complete snapshot of the database state: root page ID, freelist head, total pages allocated, and data page head.
-2. Each meta page carries a **CRC32 checksum** (hardware-accelerated via SSE4.2) covering the meaningful fields. A torn write is detected by checksum mismatch.
-3. Each meta page has a **monotonic `txn_id`**. On commit, the database writes to the *older* (inactive) meta page, bumps `txn_id`, recomputes the checksum, and flushes to disk.
-4. On open, both meta pages are validated. The one with the higher valid `txn_id` is the current state. If one is corrupt (torn write), the other is used automatically.
-5. **Flush barriers** (`FlushViewOfFile` + `FlushFileBuffers`) ensure data pages are durable before the meta page commit point.
-
-**Crash scenarios:**
-- Crash *before* meta commit → old meta page is still valid, transaction is rolled back.
-- Crash *during* meta write → torn meta page fails CRC32 validation, the other meta page (last committed state) is used.
-- Crash *after* meta commit → new state is durable.
-
-### Multi-Process Support
-
-- **Writer serialization**: A **named mutex** (derived from the file path) ensures only one writer across all processes at a time.  The mutex is held for the duration of a put/delete/write-batch operation.
-- **Reader coordination**: A **reader table** (pages 2-3, 511 slots) lives in the shared mmap.  Each `spike_db_get()` acquires a slot recording the current `txn_id` and process ID.  Stale slots from crashed processes are detected by PID liveness checks on open.
-- **Concurrent readers**: Multiple processes can read simultaneously without blocking each other or blocking the writer.
-
-### WriteBatch
-
-Multiple put/delete operations can be buffered in a `SpikeDB_WriteBatch` and applied in a single `spike_db_write()` call.  The entire batch is applied under one write mutex acquisition and produces a single meta page commit, making it both logically atomic and crash-safe.
-
-### Space Recycling
-
-Freed pages are pushed onto the freelist in the active meta page.  The bump allocator hands out new pages from the tail of the sparse file when the freelist is empty.
-
-## Building
-
-Requires MSVC (Visual Studio 2022 / 2026) with AVX2 support. From a **Developer Command Prompt**:
-
-```
-build.bat
-```
-
-The resulting `build\test_spike_db.exe` runs 26 tests (CRUD, string keys, WriteBatch, binary data, crash recovery, meta integrity, performance benchmarks) and prints the detected SIMD level.
-
-For AVX-512:
-
-```
-build.bat AVX512
-```
-
-## API
-
-### Core Operations
+## Quick example
 
 ```c
-SpikeDB_Status spike_db_open(SpikeDB** db, const char* path, uint32_t max_size_gb);
-void           spike_db_close(SpikeDB* db);
+#include "spike_db.h"
 
-SpikeDB_Status spike_db_put(SpikeDB* db,
-                             const char* key, size_t keylen,
-                             const char* val, size_t vallen);
+SpikeDB* db;
+spike_db_open(&db, "ticks.spdb", /* cache pages 64 KB */ 1024, 0);
 
-SpikeDB_Status spike_db_get(SpikeDB* db,
-                             const char* key, size_t keylen,
-                             char** val_out, size_t* vallen_out);
-
-SpikeDB_Status spike_db_delete(SpikeDB* db, const char* key, size_t keylen);
-
-void spike_db_free(void* ptr);  /* free memory returned by get */
-```
-
-### WriteBatch
-
-```c
-SpikeDB_WriteBatch* spike_db_writebatch_create(void);
-void spike_db_writebatch_destroy(SpikeDB_WriteBatch* batch);
-void spike_db_writebatch_put(SpikeDB_WriteBatch* batch,
-                              const char* key, size_t keylen,
-                              const char* val, size_t vallen);
-void spike_db_writebatch_delete(SpikeDB_WriteBatch* batch,
-                                 const char* key, size_t keylen);
-void spike_db_writebatch_clear(SpikeDB_WriteBatch* batch);
-int  spike_db_writebatch_count(const SpikeDB_WriteBatch* batch);
-SpikeDB_Status spike_db_write(SpikeDB* db, SpikeDB_WriteBatch* batch);
-```
-
-### Example
-
-```c
-SpikeDB* db = NULL;
-spike_db_open(&db, "my.db", 1);
-
-spike_db_put(db, "user:1", 6, "Alice", 5);
-
-char* val = NULL;
-size_t vlen = 0;
-if (spike_db_get(db, "user:1", 6, &val, &vlen) == SPIKEDB_OK) {
-    printf("Got: %.*s\n", (int)vlen, val);
-    spike_db_free(val);
+/* Ingest a batch of ticks atomically */
+SpikeDB_Batch* b = spike_db_batch_create();
+for (int i = 0; i < n_ticks; i++) {
+    spike_db_batch_put(b, ticks[i].symbol, ticks[i].time_ns,
+                       &ticks[i].payload, sizeof(ticks[i].payload));
 }
+spike_db_write(db, b);   /* atomic; either all commit or none */
+spike_db_batch_destroy(b);
 
-/* Batch writes — single commit, crash-safe */
-SpikeDB_WriteBatch* batch = spike_db_writebatch_create();
-spike_db_writebatch_put(batch, "user:2", 6, "Bob", 3);
-spike_db_writebatch_put(batch, "user:3", 6, "Carol", 5);
-spike_db_writebatch_delete(batch, "user:1", 6);
-spike_db_write(db, batch);
-spike_db_writebatch_destroy(batch);
+/* "Anything new since I last looked?" — single page read, no I/O */
+uint64_t latest;
+spike_db_max_time(db, BTCUSDT, &latest);
+
+/* Stream the latest 60 seconds */
+SpikeDB_Iter* it = spike_db_scan(db, BTCUSDT,
+                                 latest - 60ULL * 1000000000ULL, latest);
+uint64_t t;
+const void* val;
+size_t len;
+while (spike_db_iter_next(it, &t, &val, &len)) {
+    process_tick(t, val, len);
+}
+spike_db_iter_close(it);
 
 spike_db_close(db);
 ```
 
-### Return Codes
+---
 
-| Code | Value | Meaning |
-|------|-------|---------|
-| `SPIKEDB_OK` | 0 | Success |
-| `SPIKEDB_NOT_FOUND` | -1 | Key does not exist |
-| `SPIKEDB_ERROR` | -2 | General error (record too large, allocation failure) |
-| `SPIKEDB_FULL` | -3 | Database file is full |
+## Architecture
 
-## License
+### One skip list of leaves per symbol
 
-Unlicensed / public domain — spike away.
+```
+              ┌───────────── file ─────────────┐
+              │  Pages 0..1   Meta A / Meta B  │  double-buffered, CRC32
+              │  Pages 2..17  Symbol directory │  open-addressing hash → SymbolRoot
+              │  Pages 18..   Skip-list nodes  │
+              │               + Leaf pages     │
+              │               + Free-list      │
+              └────────────────────────────────┘
+```
+
+Every symbol owns its own skip list. The skip list indexes **leaf pages**,
+not individual records. Leaves additionally form a doubly-linked list in
+time order, so a range scan does a single `O(log N)` descent and then walks
+`next_leaf` until the upper bound — close to sequential I/O even when the
+hot data is gigabytes deep on disk.
+
+### 64 KB leaf page
+
+```
+┌─ LeafHeader ─────────────────────────────────────────────────────────┐
+│ symbol, min_time, max_time, record_count,                            │
+│ value_heap_bottom, prev_leaf, next_leaf, skiplist_node_ref           │
+├─ LeafSlot[record_count] (sorted by time, grows up) ──────────────────┤
+│ { time, value_offset, value_len }   (16 bytes per slot)              │
+│                                                                      │
+│                       ─── free space ───                             │
+│                                                                      │
+├─ value heap (grows down) ────────────────────────────────────────────┤
+│ packed value bytes                                                   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+A 64 KB leaf holds ~3000–4000 typical tick records. Iteration is just a
+binary search inside the slot directory followed by sequential reads.
+
+### `SymbolRoot` page (one per symbol)
+
+Holds `min_time` / `max_time` / `record_count` / `leaf_count`, the skip
+list head's `forward[]` array, the per-symbol RNG state used to pick
+random tower heights, and a "current node page" pointer for packing many
+skip-list nodes into a single 64 KB page. `spike_db_max_time` /
+`min_time` / `count` are a single read of this page — usually one
+warm-cache hit.
+
+### Insert paths
+
+- **Append fast path.** When `time > leaf.max_time`, the last leaf is
+  full, and there is no next leaf, the writer allocates a fresh leaf and
+  drops the record there with no data movement. This is the dominant
+  case for ingest.
+- **Mid-leaf insert.** When the time falls inside the leaf, the slot
+  directory does a `memmove` on a few bytes and the value is appended to
+  the value heap. Existing values never move.
+- **Split.** A full leaf splits at the median time, copies half the
+  records to a new leaf, fixes the linked-list pointers, and adds a new
+  skip-list index node at a random level.
+
+### Crash safety (no WAL)
+
+1. All page mutations during a transaction land on shadow copies in the
+   page cache (CoW). New page IDs come from a transaction-local
+   allocation list so a failed batch returns them to the freelist.
+2. Commit:
+   - Flush every dirty page → `FlushFileBuffers` / `fdatasync`.
+   - Write the *inactive* meta page with `txn_id + 1`.
+   - `FlushFileBuffers` / `fdatasync` again.
+   - Atomically flip the in-memory active-meta marker.
+3. Recovery picks the meta page with the highest valid CRC32-checked
+   `txn_id`; everything written by a half-done transaction is unreachable
+   from that meta and is reclaimed via the freelist.
+
+### Multi-process concurrency
+
+A single byte at file offset `1 << 40` (well past any real data) is the
+lock arena. Writers (`spike_db_write`, `spike_db_truncate_before`) take
+**exclusive**; readers (`spike_db_get`, `spike_db_scan`,
+`spike_db_max_time` / `min_time` / `count`) take **shared**. Iterators
+hold the shared lock for their lifetime so the writer cannot free leaves
+out from under them. After acquiring a lock, every operation re-reads
+both meta pages and switches to whichever is newer (`db_refresh_meta`),
+invalidating clean unpinned cache slots if another process committed.
+
+Implemented with `LockFileEx` on Windows and `fcntl(F_OFD_SETLKW)` on
+Linux (with `F_SETLKW` fallback).
+
+### Page cache
+
+Clock-sweep eviction over a fixed-size pool of 64 KB slots. O(1)
+hash-table lookup keyed by page ID, pin/unpin reference counting, dirty
+flag, copy-on-write. Backed by `pread` / `pwrite` on Linux and
+`ReadFile` / `WriteFile` with `OVERLAPPED` offsets on Windows. **No
+`mmap`** — files can grow far beyond RAM without paging behavior.
+
+---
+
+## File layout
+
+| Pages   | Contents                                                          |
+|---------|-------------------------------------------------------------------|
+| 0–1     | Double-buffered meta pages (`MetaPage`, CRC32-protected)          |
+| 2–17    | Symbol directory (open-addressing hash, ~65k slots)               |
+| 18+     | `SymbolRoot` pages, skip-list node pages, leaf pages, freelist    |
+
+All pages are 64 KB.
+
+---
+
+## API
+
+```c
+/* open / close */
+SpikeDB_Status spike_db_open (SpikeDB** out, const char* path,
+                              uint32_t cache_pages_64k, uint32_t flags);
+void           spike_db_close(SpikeDB* db);
+
+/* point lookup */
+SpikeDB_Status spike_db_get  (SpikeDB* db, uint64_t symbol, uint64_t time,
+                              void** value_out, size_t* len_out);
+void           spike_db_free (void* ptr);
+
+/* atomic batch */
+SpikeDB_Batch* spike_db_batch_create (void);
+void           spike_db_batch_destroy(SpikeDB_Batch* b);
+void           spike_db_batch_clear  (SpikeDB_Batch* b);
+size_t         spike_db_batch_count  (const SpikeDB_Batch* b);
+SpikeDB_Status spike_db_batch_put    (SpikeDB_Batch* b,
+                                      uint64_t symbol, uint64_t time,
+                                      const void* value, size_t len);
+SpikeDB_Status spike_db_write        (SpikeDB* db, SpikeDB_Batch* b);
+
+/* range scan */
+SpikeDB_Iter*  spike_db_scan      (SpikeDB* db, uint64_t symbol,
+                                   uint64_t time_lo, uint64_t time_hi);
+bool           spike_db_iter_next (SpikeDB_Iter* it, uint64_t* time_out,
+                                   const void** value_out, size_t* len_out);
+void           spike_db_iter_close(SpikeDB_Iter* it);
+
+/* hot polling helpers (single cached page read each) */
+SpikeDB_Status spike_db_max_time(SpikeDB* db, uint64_t symbol, uint64_t* out);
+SpikeDB_Status spike_db_min_time(SpikeDB* db, uint64_t symbol, uint64_t* out);
+SpikeDB_Status spike_db_count   (SpikeDB* db, uint64_t symbol, uint64_t* out);
+
+/* retention */
+SpikeDB_Status spike_db_truncate_before(SpikeDB* db, uint64_t symbol,
+                                        uint64_t time_exclusive);
+
+/* diagnostics */
+void spike_db_stats(SpikeDB* db, SpikeDB_Stats* out);
+```
+
+**Return codes:** `SPIKEDB_OK` (0), `SPIKEDB_NOT_FOUND` (-1),
+`SPIKEDB_ERROR` (-2), `SPIKEDB_FULL` (-3), `SPIKEDB_CORRUPT` (-4),
+`SPIKEDB_INVAL` (-5).
+
+**Open flags:** `SPIKEDB_OPEN_READONLY`.
+
+**Semantics worth noting:**
+
+- `(symbol, time)` is unique. Inserting the same `(symbol, time)` twice
+  is rejected with `SPIKEDB_INVAL`; the entire offending batch is rolled
+  back atomically.
+- `spike_db_batch_put` accepts entries in any order. The engine sorts
+  them by `(symbol, time)` before applying.
+- The pointer returned in `*value_out` from `spike_db_iter_next` is owned
+  by the iterator and is valid only until the next `iter_next` /
+  `iter_close` call. `spike_db_get` returns a `malloc`'d buffer that the
+  caller must release with `spike_db_free`.
+- Maximum value length is 65000 bytes (a value must fit in a leaf with
+  room for at least its own slot directory entry).
+
+---
+
+## Building
+
+Single-file C11 implementation; the only dependencies are libc and the
+OS file APIs.
+
+```powershell
+# Windows (from any PowerShell — script auto-imports MSVC env)
+./run_tests.ps1                  # AVX2 build, full test suite
+./run_tests.ps1 -Arch AVX512
+./run_tests.ps1 -Quick           # skip the long benchmark
+./build.ps1                      # build only (must be in a Developer PS)
+```
+
+```bash
+# Linux / WSL
+gcc -O2 -mavx2 -msse4.2 -I src \
+    src/spike_db.c src/test_spike_db.c \
+    -o build/test_spike_db
+./build/test_spike_db
+```
+
+The build script auto-detects Visual Studio installations including the
+2026 (year directory `18`) layout.
+
+---
+
+## Performance
+
+100k records of 64 B each (single-process, warm cache, 32 MB cache pool):
+
+| Platform                | Ingest        | Scan (warm)   | Pages used |
+|-------------------------|---------------|---------------|------------|
+| Windows MSVC AVX2       | ~1.5 M rec/s  | ~52 M rec/s   | 143        |
+| WSL GCC AVX2 (`/mnt/c`) | ~530 K rec/s  | ~38 M rec/s   | 143        |
+
+`spike_db_max_time` is a single cached page read once the `SymbolRoot`
+page is warm.
+
+---
+
+## Status / roadmap
+
+Implemented:
+
+- 64 KB page format, page cache (`pread`/`ReadFile`, no mmap)
+- Symbol directory, per-symbol skip list of leaves, doubly-linked leaf chain
+- Atomic batch writes (CoW + double-buffered CRC32 meta, no WAL)
+- Range-scan iterator with O(log N) descent then sequential walk
+- `max_time` / `min_time` / `count` — single cached page read
+- `truncate_before` for retention (atomic; reclaims whole leaves and
+  partially truncates the boundary leaf)
+- OS file range locking for multi-process safety (Windows `LockFileEx`,
+  Linux `fcntl(F_OFD_SETLKW)`)
+- Skip-list node packing (many nodes per 64 KB page)
+
+Not yet:
+
+- Per-leaf CRC32 (torn-write detection at sub-meta granularity)
+- Asynchronous read-ahead during long scans
+- SIMD intra-leaf binary search (current scalar binary search is already
+  ≤ ~12 comparisons on a full leaf)
+- Online compaction of fragmented leaf chains after heavy mid-time
+  inserts
+- Snapshot isolation across long-running readers (currently they take a
+  shared range lock for the iterator's lifetime)
+- `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` knob
+

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build
+        run: pwsh -File build.ps1 -Arch AVX2
+
+      - name: Test
+        run: pwsh -File run_tests.ps1 -Arch AVX2 -Quick
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GCC
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      - name: Build
+        run: pwsh -File build.ps1 -Arch AVX2
+
+      - name: Test
+        run: pwsh -File run_tests.ps1 -Arch AVX2 -Quick

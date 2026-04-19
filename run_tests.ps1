@@ -6,7 +6,9 @@
 #>
 param(
     [ValidateSet("AVX2", "AVX512")]
-    [string]$Arch = "AVX2"
+    [string]$Arch = "AVX2",
+
+    [switch]$Quick
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,7 +44,7 @@ if ($IsLinux) {
 } else {
     # ---------- Locate VS Developer Environment ----------
     $vcvars = $null
-    foreach ($year in @("2026", "2025", "2024", "2022", "2019")) {
+    foreach ($year in @("18", "2026", "2025", "2024", "2022", "2019")) {
         foreach ($edition in @("Enterprise", "Professional", "Community", "BuildTools")) {
             $candidate = "C:\Program Files\Microsoft Visual Studio\$year\$edition\VC\Auxiliary\Build\vcvarsall.bat"
             if (Test-Path $candidate) {
@@ -102,6 +104,14 @@ Write-Host "  Running tests ..."
 Write-Host "======================================================"
 Write-Host ""
 
+if ($Quick) {
+    $env:SPIKEDB_TEST_MODE = "quick"
+    Write-Host "[*] Test mode: quick"
+    Write-Host ""
+} else {
+    Remove-Item Env:SPIKEDB_TEST_MODE -ErrorAction SilentlyContinue
+}
+
 & $exe
 $testRC = $LASTEXITCODE
 
@@ -117,7 +127,7 @@ if ($testRC -eq 0) {
 }
 
 # Clean up temp db file if present
-if (Test-Path "test_spike_db.dat")  { Remove-Item "test_spike_db.dat" -Force }
-if (Test-Path "test_spike_db.dat.lock") { Remove-Item "test_spike_db.dat.lock" -Force }
+if (Test-Path "tmp/test_spike_db.dat")       { Remove-Item "tmp/test_spike_db.dat" -Force }
+if (Test-Path "tmp/test_spike_db.dat.lock")  { Remove-Item "tmp/test_spike_db.dat.lock" -Force }
 
 exit $testRC
