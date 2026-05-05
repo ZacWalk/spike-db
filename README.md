@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/ZacWalk/spike-db/actions/workflows/ci.yml/badge.svg)](https://github.com/ZacWalk/spike-db/actions/workflows/ci.yml)
 
+![SpikeDB architecture](spikedb-diagram.png)
 
 A single-file, embeddable, append-dominant time-series store for financial
 market data. Composite primary key `(symbol_u64, time_u64)`, sorted by

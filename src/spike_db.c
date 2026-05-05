@@ -22,6 +22,8 @@
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
+  #include <intrin.h>      /* __cpuid, _mm_crc32_* */
+  #include <nmmintrin.h>   /* _mm_crc32_u64 */
   typedef HANDLE spdb_fd_t;
   #define SPDB_INVALID_FD INVALID_HANDLE_VALUE
 #else
@@ -29,6 +31,9 @@
   #include <fcntl.h>
   #include <sys/stat.h>
   #include <sys/types.h>
+  #if defined(__SSE4_2__)
+    #include <nmmintrin.h>
+  #endif
   typedef int spdb_fd_t;
   #define SPDB_INVALID_FD (-1)
 #endif
@@ -49,19 +54,79 @@ static uint64_t mix64(uint64_t x) {
 }
 
 static uint32_t crc32_compute(const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint32_t crc = 0xFFFFFFFFu;
+
+#if defined(__SSE4_2__) || defined(_MSC_VER)
+    /* Hardware CRC32 (SSE4.2). MSVC always exposes the intrinsics; we still
+     * runtime-feature-check via __cpuid on the first call.
+     *
+     * Note: _mm_crc32_u64 computes the *Castagnoli* polynomial (CRC-32C),
+     * not the IEEE/zlib polynomial. We only need a strong checksum here
+     * (meta page integrity), not interop with another CRC. The choice of
+     * polynomial is internal to spike_db, but it must be stable: the
+     * software fallback below also computes CRC-32C. */
+    static int hw_checked = 0;
+    static int hw_ok      = 0;
+    if (!hw_checked) {
+        hw_checked = 1;
+#if defined(_MSC_VER)
+        int regs[4];
+        __cpuid(regs, 1);
+        hw_ok = (regs[2] & (1 << 20)) != 0;   /* ECX bit 20 = SSE4.2 */
+#else
+        unsigned int eax, ebx, ecx, edx;
+        if (__builtin_cpu_supports("sse4.2")) hw_ok = 1;
+        (void)eax; (void)ebx; (void)ecx; (void)edx;
+#endif
+    }
+    if (hw_ok) {
+        size_t i = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+        uint64_t c64 = crc;
+        for (; i + 8 <= len; i += 8) {
+            uint64_t v;
+            memcpy(&v, p + i, 8);
+#if defined(_MSC_VER)
+            c64 = _mm_crc32_u64(c64, v);
+#else
+            c64 = __builtin_ia32_crc32di(c64, v);
+#endif
+        }
+        crc = (uint32_t)c64;
+#endif
+        for (; i + 4 <= len; i += 4) {
+            uint32_t v;
+            memcpy(&v, p + i, 4);
+#if defined(_MSC_VER)
+            crc = _mm_crc32_u32(crc, v);
+#else
+            crc = __builtin_ia32_crc32si(crc, v);
+#endif
+        }
+        for (; i < len; i++) {
+#if defined(_MSC_VER)
+            crc = _mm_crc32_u8(crc, p[i]);
+#else
+            crc = __builtin_ia32_crc32qi(crc, p[i]);
+#endif
+        }
+        return ~crc;
+    }
+#endif
+
+    /* Software fallback: CRC-32C (Castagnoli) table-driven. */
     static uint32_t table[256];
     static int      table_built = 0;
     if (!table_built) {
         for (uint32_t i = 0; i < 256; i++) {
             uint32_t c = i;
             for (int j = 0; j < 8; j++)
-                c = (c >> 1) ^ (0xEDB88320u & -(int32_t)(c & 1));
+                c = (c >> 1) ^ (0x82F63B78u & -(int32_t)(c & 1));
             table[i] = c;
         }
         table_built = 1;
     }
-    const uint8_t* p = (const uint8_t*)data;
-    uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; i++)
         crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFF];
     return ~crc;
@@ -181,6 +246,11 @@ typedef struct CacheSlot {
     uint8_t* bytes;
     bool     dirty;
     bool     valid;
+    bool     fresh;         /* true if page_id was allocated by the current
+                             * transaction (page_pin_zero set it). Only such
+                             * pages are safe to dirty-spill mid-txn, because
+                             * they have no valid on-disk predecessor that a
+                             * rollback would need to restore. */
 } CacheSlot;
 
 struct SpikeDB {
@@ -202,6 +272,7 @@ struct SpikeDB {
     /* stats */
     uint64_t           cache_hits;
     uint64_t           cache_misses;
+    uint64_t           cache_spills;       /* dirty evictions written early */
 
     /* current write transaction (single-writer) */
     bool               in_txn;
@@ -212,6 +283,15 @@ struct SpikeDB {
     /* On rollback, allocated pages are returned to the freelist and
        any dirty cache slots are evicted (since their content is the
        half-applied txn). */
+
+    /* Scratch buffer reused by leaf_compact (avoids per-split malloc). */
+    uint8_t*           scratch_page;
+
+    /* Set whenever cache_evict fails to find a victim (all slots pinned
+     * or dirty). The current transaction can no longer make progress;
+     * spike_db_write / spike_db_truncate_before convert this into a
+     * SPIKEDB_FULL return after rolling back. Reset on txn_begin. */
+    bool               cache_oom;
 };
 
 /*============================================================================
@@ -424,17 +504,43 @@ static void ht_remove(SpikeDB* db, uint32_t page_id) {
 
 /* Find a victim slot for eviction. Clock-style sweep. */
 static uint32_t cache_evict(SpikeDB* db) {
-    for (uint32_t scan = 0; scan < db->cache_capacity * 2u; scan++) {
-        uint32_t i = db->clock_hand;
-        db->clock_hand = (db->clock_hand + 1) % db->cache_capacity;
-        CacheSlot* s = &db->slots[i];
-        if (!s->valid) return i;
-        if (s->pin_count > 0) continue;
-        if (s->dirty) continue;        /* must be flushed first */
-        ht_remove(db, s->page_id);
-        s->valid   = false;
-        s->page_id = SPIKEDB_INVALID_PAGE;
-        return i;
+    /* Two passes around the clock:
+     *   Pass 1: prefer a clean unpinned victim (no I/O).
+     *   Pass 2: if none, spill a dirty unpinned victim to disk and reuse it.
+     *
+     * Dirty spill is safe because every dirty page during a transaction is
+     * a freshly-allocated page id that is not yet reachable from any
+     * committed meta page. Writing it to disk early does not publish it;
+     * publication only happens at the meta flip in txn_commit. On crash,
+     * the previous meta is still active and the spilled bytes are
+     * unreachable garbage (reclaimed via freelist on the next clean
+     * commit's allocation, or simply leaked beyond the bump pointer). */
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        for (uint32_t scan = 0; scan < db->cache_capacity; scan++) {
+            uint32_t i = db->clock_hand;
+            db->clock_hand = (db->clock_hand + 1) % db->cache_capacity;
+            CacheSlot* s = &db->slots[i];
+            if (!s->valid) return i;
+            if (s->pin_count > 0) continue;
+            if (s->dirty) {
+                if (pass == 0) continue;        /* try clean first */
+                /* Spill is only safe for pages allocated by the current
+                 * transaction. Pre-existing pages are modified in place;
+                 * writing their mid-txn bytes to disk would corrupt the
+                 * pre-txn copy that rollback / a concurrent reader's old
+                 * meta still needs. */
+                if (!s->fresh) continue;
+                if (io_write(db, s->page_id, s->bytes) != SPIKEDB_OK)
+                    continue;                   /* I/O error: try next */
+                s->dirty = false;
+                db->cache_spills++;
+            }
+            ht_remove(db, s->page_id);
+            s->valid   = false;
+            s->fresh   = false;
+            s->page_id = SPIKEDB_INVALID_PAGE;
+            return i;
+        }
     }
     return UINT32_MAX;
 }
@@ -452,13 +558,14 @@ static uint8_t* page_pin(SpikeDB* db, uint32_t page_id) {
     }
     db->cache_misses++;
     uint32_t s = cache_evict(db);
-    if (s == UINT32_MAX) return NULL;
+    if (s == UINT32_MAX) { db->cache_oom = true; return NULL; }
     CacheSlot* slot = &db->slots[s];
     if (io_read(db, page_id, slot->bytes) != SPIKEDB_OK) return NULL;
     slot->page_id   = page_id;
     slot->pin_count = 1;
     slot->dirty     = false;
     slot->valid     = true;
+    slot->fresh     = false;
     slot->last_used = ++db->clock;
     ht_insert(db, page_id, s);
     return slot->bytes;
@@ -475,16 +582,18 @@ static uint8_t* page_pin_zero(SpikeDB* db, uint32_t page_id) {
         db->slots[s].last_used = ++db->clock;
         memset(db->slots[s].bytes, 0, SPIKEDB_PAGE_SIZE);
         db->slots[s].dirty = true;
+        db->slots[s].fresh = db->in_txn;
         return db->slots[s].bytes;
     }
     uint32_t s = cache_evict(db);
-    if (s == UINT32_MAX) return NULL;
+    if (s == UINT32_MAX) { db->cache_oom = true; return NULL; }
     CacheSlot* slot = &db->slots[s];
     memset(slot->bytes, 0, SPIKEDB_PAGE_SIZE);
     slot->page_id   = page_id;
     slot->pin_count = 1;
     slot->dirty     = true;
     slot->valid     = true;
+    slot->fresh     = db->in_txn;
     slot->last_used = ++db->clock;
     ht_insert(db, page_id, s);
     return slot->bytes;
@@ -503,25 +612,79 @@ static void page_dirty(SpikeDB* db, uint32_t page_id) {
     db->slots[db->ht[i]].dirty = true;
 }
 
+/* Flush all dirty pages, sorted by page id so the kernel/storage sees
+ * sequential writes and can coalesce them. With v5's typical 32-128 dirty
+ * pages per batch, this is a meaningful win over the previous
+ * iteration-order flush. */
 static SpikeDB_Status cache_flush_all(SpikeDB* db) {
+    /* Encode (page_id<<32)|slot_idx so a single u64 sort produces both
+     * a page-ordered traversal and the slot index to look up bytes. */
+    uint64_t  small[256];
+    uint64_t* keys = small;
+    uint32_t  count = 0;
+    uint32_t  cap   = (uint32_t)(sizeof(small) / sizeof(small[0]));
+    bool keys_heap = false;
     for (uint32_t i = 0; i < db->cache_capacity; i++) {
         CacheSlot* s = &db->slots[i];
         if (!s->valid || !s->dirty) continue;
-        if (io_write(db, s->page_id, s->bytes) != SPIKEDB_OK) return SPIKEDB_ERROR;
-        s->dirty = false;
+        if (count == cap) {
+            uint32_t newcap = cap * 2;
+            uint64_t* nu;
+            if (keys_heap) nu = (uint64_t*)realloc(keys, newcap * sizeof(uint64_t));
+            else {
+                nu = (uint64_t*)malloc(newcap * sizeof(uint64_t));
+                if (nu) memcpy(nu, keys, count * sizeof(uint64_t));
+            }
+            if (!nu) { if (keys_heap) free(keys); return SPIKEDB_ERROR; }
+            keys = nu; cap = newcap; keys_heap = true;
+        }
+        keys[count++] = ((uint64_t)s->page_id << 32) | (uint64_t)i;
     }
-    return SPIKEDB_OK;
+    if (count == 0) return SPIKEDB_OK;
+
+    /* Insertion sort for small N is faster than qsort overhead. */
+    for (uint32_t i = 1; i < count; i++) {
+        uint64_t k = keys[i];
+        uint32_t j = i;
+        while (j > 0 && keys[j - 1] > k) { keys[j] = keys[j - 1]; j--; }
+        keys[j] = k;
+    }
+
+    SpikeDB_Status rv = SPIKEDB_OK;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t s = (uint32_t)(keys[i] & 0xFFFFFFFFu);
+        CacheSlot* slot = &db->slots[s];
+        if (io_write(db, slot->page_id, slot->bytes) != SPIKEDB_OK) {
+            rv = SPIKEDB_ERROR;
+            break;
+        }
+        slot->dirty = false;
+        slot->fresh = false;    /* committed: page is permanent now */
+    }
+    /* Also clear fresh on any slots that were spilled earlier in this
+     * txn (already clean, didn't appear in the dirty list above). */
+    if (rv == SPIKEDB_OK) {
+        for (uint32_t i = 0; i < db->cache_capacity; i++)
+            db->slots[i].fresh = false;
+    }
+    if (keys_heap) free(keys);
+    return rv;
 }
 
-/* Discard all dirty pages (rollback). */
+/* Discard all dirty pages (rollback). Also invalidate any clean-but-fresh
+ * slots: those are pages that were spilled mid-txn so their in-cache bytes
+ * reflect aborted mid-txn state, and their page ids are about to be
+ * returned to the freelist by the rollback. */
 static void cache_discard_dirty(SpikeDB* db) {
     for (uint32_t i = 0; i < db->cache_capacity; i++) {
         CacheSlot* s = &db->slots[i];
-        if (!s->valid || !s->dirty) continue;
-        if (s->pin_count != 0) continue;
+        if (!s->valid) continue;
+        if (s->pin_count != 0) { s->fresh = false; continue; }
+        if (!s->dirty && !s->fresh) continue;
         ht_remove(db, s->page_id);
         s->valid   = false;
         s->dirty   = false;
+        s->fresh   = false;
         s->page_id = SPIKEDB_INVALID_PAGE;
     }
 }
@@ -619,6 +782,7 @@ static SpikeDB_Status txn_begin(SpikeDB* db) {
     if (db->readonly) return SPIKEDB_ERROR;
     db->in_txn = true;
     db->txn_allocated_count = 0;
+    db->cache_oom = false;
     /* Stage future writes against the *inactive* meta page so the active
      * one stays consistent until commit. We work directly on the active
      * meta and copy to inactive at commit. */
@@ -984,14 +1148,21 @@ static SpikeDB_Status leaf_insert(uint8_t* page, uint64_t time,
     return SPIKEDB_OK;
 }
 
-/* Compact a leaf's value heap. Used after a split to reclaim space. */
-static void leaf_compact(uint8_t* page) {
+/* Compact a leaf's value heap. Used after a split to reclaim space.
+ * Uses db->scratch_page (lazily allocated) to avoid per-call malloc. */
+static SpikeDB_Status leaf_compact(SpikeDB* db, uint8_t* page) {
     LeafHeader* h = (LeafHeader*)page;
     LeafSlot*   slots = leaf_slots(page);
-    /* Copy values to a temp buffer in stack? Pages are 64KB — too big.
-     * Compact in place: collect values, write to temp on heap. */
-    uint8_t* tmp = (uint8_t*)malloc(SPIKEDB_PAGE_SIZE);
-    if (!tmp) return;
+    if (!db->scratch_page) {
+#ifdef _WIN32
+        db->scratch_page = (uint8_t*)_aligned_malloc(SPIKEDB_PAGE_SIZE, 64);
+#else
+        if (posix_memalign((void**)&db->scratch_page, 64, SPIKEDB_PAGE_SIZE) != 0)
+            db->scratch_page = NULL;
+#endif
+        if (!db->scratch_page) return SPIKEDB_ERROR;
+    }
+    uint8_t* tmp = db->scratch_page;
     uint32_t cursor = SPIKEDB_PAGE_SIZE;
     for (uint32_t i = 0; i < h->record_count; i++) {
         uint16_t vl = slots[i].value_len;
@@ -1001,7 +1172,7 @@ static void leaf_compact(uint8_t* page) {
     }
     memcpy(page + cursor, tmp + cursor, SPIKEDB_PAGE_SIZE - cursor);
     h->value_heap_bottom = cursor;
-    free(tmp);
+    return SPIKEDB_OK;
 }
 
 /*============================================================================
@@ -1132,7 +1303,9 @@ static SpikeDB_Status leaf_split(SpikeDB* db, uint32_t root_pg, uint32_t leaf_pg
         lh->min_time = UINT64_MAX;
         lh->max_time = 0;
     }
-    leaf_compact(lb);
+    if (leaf_compact(db, lb) != SPIKEDB_OK) {
+        page_unpin(db, new_pg); page_unpin(db, leaf_pg); return SPIKEDB_ERROR;
+    }
 
     /* Linked list splice: new_leaf goes after old_leaf */
     nh->prev_leaf = leaf_pg;
@@ -1395,11 +1568,12 @@ SpikeDB_Status spike_db_open(SpikeDB** out, const char* path,
     db->fd = SPDB_INVALID_FD;
     db->readonly = (flags & SPIKEDB_OPEN_READONLY) != 0;
 
-    /* Open file */
+    /* Open file. In read-only mode we do NOT create a missing file. */
 #ifdef _WIN32
-    DWORD access = db->readonly ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
-    DWORD share  = FILE_SHARE_READ | FILE_SHARE_WRITE;
-    db->fd = CreateFileA(path, access, share, NULL, OPEN_ALWAYS,
+    DWORD access   = db->readonly ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
+    DWORD share    = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    DWORD creation = db->readonly ? OPEN_EXISTING : OPEN_ALWAYS;
+    db->fd = CreateFileA(path, access, share, NULL, creation,
                          FILE_ATTRIBUTE_NORMAL, NULL);
     if (db->fd == SPDB_INVALID_FD) { free(db); return SPIKEDB_ERROR; }
     LARGE_INTEGER sz;
@@ -1485,6 +1659,13 @@ void spike_db_close(SpikeDB* db) {
 #endif
     }
     free(db->txn_allocated);
+    if (db->scratch_page) {
+#ifdef _WIN32
+        _aligned_free(db->scratch_page);
+#else
+        free(db->scratch_page);
+#endif
+    }
     free(db);
 }
 
@@ -1621,7 +1802,10 @@ SpikeDB_Status spike_db_write(SpikeDB* db, SpikeDB_Batch* b) {
     /* Sort entries by (symbol, time) to amortize symdir lookups */
     qsort(b->entries, b->count, sizeof(BatchEntry), batch_cmp);
 
-    uint64_t cur_sym = b->entries[0].symbol + 1;  /* force lookup on first entry */
+    /* Because entries are sorted by (symbol, time), we only call
+     * symdir_lookup once per distinct symbol. Use a sentinel != first
+     * symbol to force the very first lookup. */
+    uint64_t cur_sym = b->entries[0].symbol + 1;
     uint32_t root_pg = SPIKEDB_INVALID_PAGE;
 
     for (size_t i = 0; i < b->count; i++) {
@@ -1639,9 +1823,12 @@ SpikeDB_Status spike_db_write(SpikeDB* db, SpikeDB_Batch* b) {
     return cs;
 
 rollback:
-    txn_rollback(db);
-    file_unlock(db);
-    return SPIKEDB_ERROR;
+    {
+        bool oom = db->cache_oom;
+        txn_rollback(db);
+        file_unlock(db);
+        return oom ? SPIKEDB_FULL : SPIKEDB_ERROR;
+    }
 }
 
 /*============================================================================
@@ -1792,27 +1979,33 @@ static SpikeDB_Status read_root_field(SpikeDB* db, uint64_t symbol,
 
 SpikeDB_Status spike_db_max_time(SpikeDB* db, uint64_t symbol, uint64_t* out) {
     if (!db || !out) return SPIKEDB_INVAL;
+    *out = 0;
     SpikeDB_Status st = read_root_field(db, symbol, offsetof(SymbolRootPage, max_time), out);
     if (st == SPIKEDB_OK && *out == 0) {
         /* check record_count to disambiguate empty */
-        uint64_t cnt;
+        uint64_t cnt = 0;
         if (read_root_field(db, symbol, offsetof(SymbolRootPage, record_count), &cnt) == SPIKEDB_OK
-            && cnt == 0) return SPIKEDB_NOT_FOUND;
+            && cnt == 0) { *out = 0; return SPIKEDB_NOT_FOUND; }
     }
+    if (st != SPIKEDB_OK) *out = 0;
     return st;
 }
 
 SpikeDB_Status spike_db_min_time(SpikeDB* db, uint64_t symbol, uint64_t* out) {
     if (!db || !out) return SPIKEDB_INVAL;
+    *out = 0;
     SpikeDB_Status st = read_root_field(db, symbol, offsetof(SymbolRootPage, min_time), out);
-    if (st == SPIKEDB_OK && *out == UINT64_MAX) return SPIKEDB_NOT_FOUND;
+    if (st == SPIKEDB_OK && *out == UINT64_MAX) { *out = 0; return SPIKEDB_NOT_FOUND; }
+    if (st != SPIKEDB_OK) *out = 0;
     return st;
 }
 
 SpikeDB_Status spike_db_count(SpikeDB* db, uint64_t symbol, uint64_t* out) {
     if (!db || !out) return SPIKEDB_INVAL;
+    *out = 0;
     SpikeDB_Status st = read_root_field(db, symbol, offsetof(SymbolRootPage, record_count), out);
     if (st == SPIKEDB_NOT_FOUND) { *out = 0; return SPIKEDB_OK; }
+    if (st != SPIKEDB_OK) *out = 0;
     return st;
 }
 
@@ -1822,7 +2015,7 @@ SpikeDB_Status spike_db_count(SpikeDB* db, uint64_t symbol, uint64_t* out) {
 
 /* Remove records with time < cutoff from `leaf`. Updates header. Returns
  * the number of records removed. */
-static uint32_t leaf_drop_below(uint8_t* page, uint64_t cutoff) {
+static uint32_t leaf_drop_below(SpikeDB* db, uint8_t* page, uint64_t cutoff) {
     LeafHeader* h = (LeafHeader*)page;
     LeafSlot*   ls = leaf_slots(page);
     if (h->record_count == 0 || h->min_time >= cutoff) return 0;
@@ -1842,7 +2035,7 @@ static uint32_t leaf_drop_below(uint8_t* page, uint64_t cutoff) {
     } else {
         h->min_time = ls[0].time;
         h->max_time = ls[h->record_count - 1].time;
-        leaf_compact(page);
+        (void)leaf_compact(db, page);
     }
     return removed;
 }
@@ -1887,7 +2080,7 @@ SpikeDB_Status spike_db_truncate_before(SpikeDB* db, uint64_t symbol,
             leaf_pg = next;
         } else {
             /* Partial or full survival */
-            uint32_t r = leaf_drop_below(lb, cutoff);
+            uint32_t r = leaf_drop_below(db, lb, cutoff);
             removed_total += r;
             if (r > 0) page_dirty(db, leaf_pg);
             new_first = leaf_pg;
@@ -2032,9 +2225,12 @@ SpikeDB_Status spike_db_truncate_before(SpikeDB* db, uint64_t symbol,
     return cs;
 
 fail:
-    txn_rollback(db);
-    file_unlock(db);
-    return SPIKEDB_ERROR;
+    {
+        bool oom = db->cache_oom;
+        txn_rollback(db);
+        file_unlock(db);
+        return oom ? SPIKEDB_FULL : SPIKEDB_ERROR;
+    }
 }
 
 void spike_db_stats(SpikeDB* db, SpikeDB_Stats* out) {
@@ -2046,6 +2242,7 @@ void spike_db_stats(SpikeDB* db, SpikeDB_Stats* out) {
     out->cache_capacity = db->cache_capacity;
     out->cache_hits     = db->cache_hits;
     out->cache_misses   = db->cache_misses;
+    out->cache_spills   = db->cache_spills;
     out->symbol_count   = m->symbol_count;
     for (uint32_t i = 0; i < db->cache_capacity; i++)
         if (db->slots[i].valid) out->cache_used++;
