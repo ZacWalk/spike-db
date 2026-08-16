@@ -17,22 +17,39 @@ jobs:
         with:
           arch: x64
 
-      - name: Build
-        run: pwsh -File build.ps1 -Arch AVX2
+      - name: Build and test
+        run: pwsh -File dd.ps1 run -Arch AVX2 -Quick
 
-      - name: Test
-        run: pwsh -File run_tests.ps1 -Arch AVX2 -Quick
+      # The structural audit walks the page cache and hash table at the exit
+      # of every mutating call. It perturbs cache timing, so it is a separate
+      # pass rather than the default.
+      - name: Audit build
+        run: pwsh -File dd.ps1 audit -Arch AVX2 -Quick
+
+      # A leaked page pin is invisible at the default 32 MiB cache and
+      # surfaces as SPIKEDB_FULL once the clock sweep runs out of victims.
+      - name: Low-memory passes
+        run: pwsh -File dd.ps1 lowmem -Arch AVX2 -Quick
 
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install GCC
-        run: sudo apt-get update && sudo apt-get install -y gcc
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc cmake ninja-build
 
-      - name: Build
-        run: pwsh -File build.ps1 -Arch AVX2
+      - name: Build and test
+        run: pwsh -File dd.ps1 run -Arch AVX2 -Quick
 
-      - name: Test
-        run: pwsh -File run_tests.ps1 -Arch AVX2 -Quick
+      - name: Audit build
+        run: pwsh -File dd.ps1 audit -Arch AVX2 -Quick
+
+      - name: Low-memory passes
+        run: pwsh -File dd.ps1 lowmem -Arch AVX2 -Quick
+
+      # The fixed-width leaf layout casts uint64_t/uint32_t into a packed
+      # page, so misalignment and out-of-bounds are the failure modes that
+      # matter most here.
+      - name: Sanitizers (ASan + UBSan)
+        run: pwsh -File dd.ps1 asan -Arch AVX2 -Quick
