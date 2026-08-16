@@ -1,7 +1,7 @@
 /*============================================================================
- * spike_db.c  —  SpikeDB v5 implementation
+ * spike_db.c  —  SpikeDB v7 implementation
  *
- * See docs/skiplist-redesign-plan.md for design.
+ * See docs/design.md for design.
  *
  * Conventions:
  *   - All public symbols prefixed `spike_db_` / `SpikeDB_`.
@@ -11,10 +11,12 @@
  *============================================================================*/
 
 #include "spike_db.h"
+#include "spike_db_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <assert.h>
 #include <errno.h>
 #include <stdint.h>
@@ -29,6 +31,7 @@
 #else
   #include <unistd.h>
   #include <fcntl.h>
+  #include <time.h>
   #include <sys/stat.h>
   #include <sys/types.h>
   #if defined(__SSE4_2__)
@@ -46,6 +49,36 @@
 #define SPDB_MIN(a,b)  ((a)<(b)?(a):(b))
 #define SPDB_MAX(a,b)  ((a)>(b)?(a):(b))
 
+/* Structural audit hook (docs/testing.md §5): walks the handle's cache and
+ * hash table at points where no operation should be in flight. Compiled out
+ * unless SPIKEDB_AUDIT is defined; the test build turns it on. */
+#ifdef SPIKEDB_AUDIT
+static void spdb_audit(SpikeDB* db, const char* where) {
+    char msg[192];
+    int n = spike_db_internal_check(db, msg, sizeof(msg));
+    if (n) {
+        fprintf(stderr, "\nspikedb: %d invariant failure(s) after %s: %s\n",
+                n, where, msg);
+        fflush(stderr);
+        abort();
+    }
+}
+#define SPDB_AUDIT(db) spdb_audit((db), __func__)
+#else
+#define SPDB_AUDIT(db) ((void)0)
+#endif
+
+/* Every page reserves its last 4 bytes for a CRC-32C of the bytes before
+ * it. The meta page already had its checksum there; data pages follow the
+ * same convention so one helper can stamp and verify all of them. */
+#define SPDB_PAGE_CRC_OFF   (SPIKEDB_PAGE_SIZE - 4u)
+#define SPDB_PAGE_BODY      SPDB_PAGE_CRC_OFF
+
+/* Compile-time guard for the on-disk layout. Every size below is baked
+ * into files on disk, and every capacity has to stop short of the
+ * checksum trailer. */
+#define SPDB_STATIC_ASSERT(cond, name) typedef char spdb_assert_##name[(cond) ? 1 : -1]
+
 static uint64_t mix64(uint64_t x) {
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
@@ -53,11 +86,34 @@ static uint64_t mix64(uint64_t x) {
     return x;
 }
 
-static uint32_t crc32_compute(const void* data, size_t len) {
+/* Software fallback: CRC-32C (Castagnoli) table-driven. Kept separate from
+ * crc32_compute so the suite can assert the two paths agree byte for byte;
+ * a divergence makes files written on one machine unreadable on another. */
+static uint32_t crc32c_sw(const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
     uint32_t crc = 0xFFFFFFFFu;
 
+    static uint32_t table[256];
+    static int      table_built = 0;
+    if (!table_built) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; j++)
+                c = (c >> 1) ^ (0x82F63B78u & -(int32_t)(c & 1));
+            table[i] = c;
+        }
+        table_built = 1;
+    }
+    for (size_t i = 0; i < len; i++)
+        crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFF];
+    return ~crc;
+}
+
+static uint32_t crc32_compute(const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data;
+
 #if defined(__SSE4_2__) || defined(_MSC_VER)
+    uint32_t crc = 0xFFFFFFFFu;
     /* Hardware CRC32 (SSE4.2). MSVC always exposes the intrinsics; we still
      * runtime-feature-check via __cpuid on the first call.
      *
@@ -115,21 +171,13 @@ static uint32_t crc32_compute(const void* data, size_t len) {
     }
 #endif
 
-    /* Software fallback: CRC-32C (Castagnoli) table-driven. */
-    static uint32_t table[256];
-    static int      table_built = 0;
-    if (!table_built) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int j = 0; j < 8; j++)
-                c = (c >> 1) ^ (0x82F63B78u & -(int32_t)(c & 1));
-            table[i] = c;
-        }
-        table_built = 1;
-    }
-    for (size_t i = 0; i < len; i++)
-        crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFF];
-    return ~crc;
+    return crc32c_sw(p, len);
+}
+
+/* Internal, not part of the public API: lets the suite compare the two CRC
+ * paths in one process. Declared in spike_db_internal.h. */
+uint32_t spike_db_internal_crc32c(const void* data, size_t len, int force_software) {
+    return force_software ? crc32c_sw(data, len) : crc32_compute(data, len);
 }
 
 /*============================================================================
@@ -145,7 +193,10 @@ typedef struct MetaPage {
     uint32_t freelist_head;             /* page id of first free-list page, or INVALID */
     uint32_t symbol_count;
     uint64_t reader_epoch;              /* bumped each commit */
-    uint8_t  reserved[SPIKEDB_PAGE_SIZE - 8 - 8 - 8 - 4 - 4 - 8 - 4];
+    uint32_t user_meta_len;             /* bytes used in user_meta */
+    uint8_t  user_meta[SPIKEDB_META_CAPACITY];  /* [u16 klen][u16 vlen][key][val]... */
+    uint8_t  reserved[SPIKEDB_PAGE_SIZE - 8 - 8 - 8 - 4 - 4 - 8 - 4
+                      - SPIKEDB_META_CAPACITY - 4];
     uint32_t crc32;                     /* CRC of bytes [0 .. PAGE_SIZE-4) */
 } MetaPage;
 
@@ -164,11 +215,12 @@ typedef struct FreelistPage {
     /* uint32_t pages[ (PAGE_SIZE - 16) / 4 ] follows */
 } FreelistPage;
 
-#define FREELIST_CAPACITY  ((SPIKEDB_PAGE_SIZE - sizeof(FreelistPage)) / sizeof(uint32_t))
+#define FREELIST_CAPACITY  ((SPDB_PAGE_BODY - sizeof(FreelistPage)) / sizeof(uint32_t))
 
 /* Skip-list index node — packed into "node pages" */
 typedef struct SkipNode {
     uint64_t first_time;            /* min time of pointed-to leaf */
+    uint32_t first_seq;             /* seq of that leaf's first record */
     uint32_t leaf_page;             /* INVALID for unused slot */
     uint8_t  level;                 /* tower height 1..MAX_LEVEL */
     uint8_t  _pad[3];
@@ -176,7 +228,7 @@ typedef struct SkipNode {
 } SkipNode;
 
 #define NODE_PAGE_HDR_SIZE   16u
-#define NODE_PAGE_CAPACITY   ((SPIKEDB_PAGE_SIZE - NODE_PAGE_HDR_SIZE) / sizeof(SkipNode))
+#define NODE_PAGE_CAPACITY   ((SPDB_PAGE_BODY - NODE_PAGE_HDR_SIZE) / sizeof(SkipNode))
 
 typedef struct NodePageHeader {
     uint32_t used_count;            /* slots [1..used_count] are valid; slot 0 reserved */
@@ -204,27 +256,39 @@ typedef struct SymbolRootPage {
     uint8_t  _pad[3];
     uint32_t rng_state;
     uint32_t current_node_page;     /* node page currently being packed (INVALID = none) */
-    uint32_t _pad2;
+    uint32_t record_size;           /* 0 = variable-width, else fixed columnar leaves */
     uint64_t head_forward[SPIKEDB_MAX_LEVEL];   /* sentinel head's forward refs */
     /* pad to PAGE_SIZE */
 } SymbolRootPage;
 
-/* Leaf page header. Slot dir grows up after header; value heap grows down. */
+/* Leaf page header.
+ *
+ * Variable-width leaves: slot dir grows up after the header, value heap
+ * grows down from SPDB_PAGE_BODY.
+ *
+ * Fixed-width leaves (record_size != 0): three columnar arrays of fixed
+ * capacity, so a range read is one memcpy out of the payload column and
+ * there is no per-record slot to store.
+ *   times[cap] | seqs[cap] | payloads[cap * record_size]
+ *
+ * The header is padded to 64 bytes so those arrays stay naturally aligned.
+ */
 typedef struct LeafHeader {
     uint64_t symbol;
     uint64_t min_time;
     uint64_t max_time;
     uint32_t record_count;
-    uint32_t value_heap_bottom;     /* offset of lowest-addressed value byte */
+    uint32_t value_heap_bottom;     /* variable-width only */
     uint32_t prev_leaf;
     uint32_t next_leaf;
     uint64_t skiplist_node_ref;     /* node_ref of this leaf's index entry */
-    uint32_t _pad;
-    /* slot dir starts at sizeof(LeafHeader); each slot 16 bytes */
+    uint32_t record_size;
+    uint8_t  _pad[12];
 } LeafHeader;
 
 typedef struct LeafSlot {
     uint64_t time;
+    uint32_t seq;                   /* tiebreaker for equal timestamps */
     uint32_t value_offset;          /* byte offset within page */
     uint16_t value_len;
     uint16_t _pad;
@@ -234,6 +298,38 @@ typedef struct LeafSlot {
 
 #define LEAF_SLOT_SIZE       (sizeof(LeafSlot))
 #define LEAF_HDR_SIZE        (sizeof(LeafHeader))
+
+/* Fixed-width leaf geometry. */
+#define LEAF_FIXED_STRIDE(R)  (8u + 4u + (uint32_t)(R))
+#define LEAF_FIXED_CAP(R)     ((uint32_t)((SPDB_PAGE_BODY - (uint32_t)LEAF_HDR_SIZE) \
+                                          / LEAF_FIXED_STRIDE(R)))
+
+/* Largest record_size that still fits a useful number of rows per leaf. */
+#define LEAF_FIXED_MAX_REC    16384u
+
+SPDB_STATIC_ASSERT(sizeof(MetaPage) == SPIKEDB_PAGE_SIZE,        meta_page_size);
+SPDB_STATIC_ASSERT(sizeof(LeafHeader) == 64,                     leaf_header_size);
+SPDB_STATIC_ASSERT(sizeof(LeafSlot) == 20,                       leaf_slot_size);
+SPDB_STATIC_ASSERT(sizeof(SkipNode) == 148,                      skip_node_size);
+SPDB_STATIC_ASSERT(sizeof(SymDirSlot) == 16,                     symdir_slot_size);
+/* The fixed layout casts uint64_t/uint32_t at these offsets. */
+SPDB_STATIC_ASSERT(sizeof(LeafHeader) % 8 == 0,                  leaf_header_aligned);
+SPDB_STATIC_ASSERT(NODE_PAGE_HDR_SIZE + NODE_PAGE_CAPACITY * sizeof(SkipNode)
+                   <= SPDB_PAGE_BODY,                            node_page_fits);
+SPDB_STATIC_ASSERT(sizeof(FreelistPage) + FREELIST_CAPACITY * sizeof(uint32_t)
+                   <= SPDB_PAGE_BODY,                            freelist_fits);
+SPDB_STATIC_ASSERT(LEAF_HDR_SIZE + LEAF_FIXED_CAP(1) * LEAF_FIXED_STRIDE(1)
+                   <= SPDB_PAGE_BODY,                            fixed_leaf_fits_min);
+SPDB_STATIC_ASSERT(LEAF_HDR_SIZE + LEAF_FIXED_CAP(LEAF_FIXED_MAX_REC)
+                                 * LEAF_FIXED_STRIDE(LEAF_FIXED_MAX_REC)
+                   <= SPDB_PAGE_BODY,                            fixed_leaf_fits_max);
+
+/* Total order on the (time, seq) part of the primary key. */
+static int key_cmp(uint64_t t1, uint32_t s1, uint64_t t2, uint32_t s2) {
+    if (t1 != t2) return t1 < t2 ? -1 : 1;
+    if (s1 != s2) return s1 < s2 ? -1 : 1;
+    return 0;
+}
 
 /*============================================================================
  * Page cache
@@ -264,6 +360,11 @@ struct SpikeDB {
     uint64_t           clock;
     uint32_t           clock_hand;
 
+    /* Every page read/write, fsync and file lock goes through here. Always
+     * &spike_db_internal_io_os except while a test has a wrapper installed;
+     * see spike_db_internal.h. */
+    const SpikeDB_IoOps* io;
+
     /* meta */
     MetaPage           meta_buf[2];
     int                active_meta;        /* 0 or 1 */
@@ -292,13 +393,42 @@ struct SpikeDB {
      * spike_db_write / spike_db_truncate_before convert this into a
      * SPIKEDB_FULL return after rolling back. Reset on txn_begin. */
     bool               cache_oom;
+
+    SpikeDB_Error      last_error;
 };
 
 /*============================================================================
- * I/O helpers
+ * Error reporting
  *============================================================================*/
 
-static SpikeDB_Status io_read(SpikeDB* db, uint32_t page_id, void* buf) {
+static int os_last_error(void) {
+#ifdef _WIN32
+    return (int)GetLastError();
+#else
+    return errno;
+#endif
+}
+
+static SpikeDB_Status set_err(SpikeDB* db, SpikeDB_Status st, int os_err,
+                              uint64_t page, const char* msg) {
+    if (db) {
+        db->last_error.status   = st;
+        db->last_error.os_error = os_err;
+        db->last_error.page     = page;
+        snprintf(db->last_error.message, sizeof(db->last_error.message), "%s", msg);
+    }
+    return st;
+}
+
+/*============================================================================
+ * I/O helpers
+ *
+ * io_read / io_write / io_fsync / file_lock / file_unlock dispatch through
+ * db->io so a test can install a wrapper; the *_os functions below are the
+ * real implementations and the installed default.
+ *============================================================================*/
+
+static SpikeDB_Status io_read_os(SpikeDB* db, uint32_t page_id, void* buf) {
     uint64_t off = (uint64_t)page_id * SPIKEDB_PAGE_SIZE;
 #ifdef _WIN32
     OVERLAPPED ov = {0};
@@ -310,20 +440,20 @@ static SpikeDB_Status io_read(SpikeDB* db, uint32_t page_id, void* buf) {
             memset(buf, 0, SPIKEDB_PAGE_SIZE);
             return SPIKEDB_OK;
         }
-        return SPIKEDB_ERROR;
+        return set_err(db, SPIKEDB_ERROR, os_last_error(), page_id, "page read failed");
     }
     if (got < SPIKEDB_PAGE_SIZE)
         memset((uint8_t*)buf + got, 0, SPIKEDB_PAGE_SIZE - got);
 #else
     ssize_t n = pread(db->fd, buf, SPIKEDB_PAGE_SIZE, (off_t)off);
-    if (n < 0) return SPIKEDB_ERROR;
+    if (n < 0) return set_err(db, SPIKEDB_ERROR, os_last_error(), page_id, "page read failed");
     if ((size_t)n < SPIKEDB_PAGE_SIZE)
         memset((uint8_t*)buf + n, 0, SPIKEDB_PAGE_SIZE - (size_t)n);
 #endif
     return SPIKEDB_OK;
 }
 
-static SpikeDB_Status io_write(SpikeDB* db, uint32_t page_id, const void* buf) {
+static SpikeDB_Status io_write_os(SpikeDB* db, uint32_t page_id, const void* buf) {
     uint64_t off = (uint64_t)page_id * SPIKEDB_PAGE_SIZE;
 #ifdef _WIN32
     OVERLAPPED ov = {0};
@@ -331,23 +461,38 @@ static SpikeDB_Status io_write(SpikeDB* db, uint32_t page_id, const void* buf) {
     ov.OffsetHigh = (DWORD)(off >> 32);
     DWORD wrote = 0;
     if (!WriteFile(db->fd, buf, SPIKEDB_PAGE_SIZE, &wrote, &ov))
-        return SPIKEDB_ERROR;
-    if (wrote != SPIKEDB_PAGE_SIZE) return SPIKEDB_ERROR;
+        return set_err(db, SPIKEDB_ERROR, os_last_error(), page_id, "page write failed");
+    if (wrote != SPIKEDB_PAGE_SIZE)
+        return set_err(db, SPIKEDB_ERROR, 0, page_id, "short page write");
 #else
     ssize_t n = pwrite(db->fd, buf, SPIKEDB_PAGE_SIZE, (off_t)off);
-    if (n != (ssize_t)SPIKEDB_PAGE_SIZE) return SPIKEDB_ERROR;
+    if (n != (ssize_t)SPIKEDB_PAGE_SIZE)
+        return set_err(db, SPIKEDB_ERROR, os_last_error(), page_id, "page write failed");
 #endif
     uint64_t needed = off + SPIKEDB_PAGE_SIZE;
     if (needed > db->file_size) db->file_size = needed;
     return SPIKEDB_OK;
 }
 
-static SpikeDB_Status io_fsync(SpikeDB* db) {
+static SpikeDB_Status io_fsync_os(SpikeDB* db) {
 #ifdef _WIN32
-    return FlushFileBuffers(db->fd) ? SPIKEDB_OK : SPIKEDB_ERROR;
+    if (FlushFileBuffers(db->fd)) return SPIKEDB_OK;
 #else
-    return fdatasync(db->fd) == 0 ? SPIKEDB_OK : SPIKEDB_ERROR;
+    if (fdatasync(db->fd) == 0) return SPIKEDB_OK;
 #endif
+    return set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE, "fsync failed");
+}
+
+static SpikeDB_Status io_read(SpikeDB* db, uint32_t page_id, void* buf) {
+    return db->io->read(db, page_id, buf);
+}
+
+static SpikeDB_Status io_write(SpikeDB* db, uint32_t page_id, const void* buf) {
+    return db->io->write(db, page_id, buf);
+}
+
+static SpikeDB_Status io_fsync(SpikeDB* db) {
+    return db->io->fsync(db);
 }
 
 /* Forward decl: needed by db_refresh_meta below. */
@@ -368,14 +513,15 @@ static void ht_remove(SpikeDB* db, uint32_t page_id);
 #define SPDB_LOCK_OFFSET   ((uint64_t)1 << 40)
 #define SPDB_LOCK_LEN      1u
 
-static SpikeDB_Status file_lock(SpikeDB* db, bool exclusive) {
+static SpikeDB_Status file_lock_os(SpikeDB* db, bool exclusive) {
 #ifdef _WIN32
     OVERLAPPED ov = {0};
     ov.Offset     = (DWORD)(SPDB_LOCK_OFFSET & 0xFFFFFFFFu);
     ov.OffsetHigh = (DWORD)(SPDB_LOCK_OFFSET >> 32);
     DWORD flags = exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0;
     if (!LockFileEx(db->fd, flags, 0, SPDB_LOCK_LEN, 0, &ov))
-        return SPIKEDB_ERROR;
+        return set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
+                       exclusive ? "exclusive file lock failed" : "shared file lock failed");
     return SPIKEDB_OK;
 #else
     struct flock fl;
@@ -388,11 +534,12 @@ static SpikeDB_Status file_lock(SpikeDB* db, bool exclusive) {
     if (fcntl(db->fd, F_OFD_SETLKW, &fl) == 0) return SPIKEDB_OK;
   #endif
     if (fcntl(db->fd, F_SETLKW, &fl) == 0) return SPIKEDB_OK;
-    return SPIKEDB_ERROR;
+    return set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
+                   exclusive ? "exclusive file lock failed" : "shared file lock failed");
 #endif
 }
 
-static void file_unlock(SpikeDB* db) {
+static void file_unlock_os(SpikeDB* db) {
 #ifdef _WIN32
     OVERLAPPED ov = {0};
     ov.Offset     = (DWORD)(SPDB_LOCK_OFFSET & 0xFFFFFFFFu);
@@ -412,6 +559,36 @@ static void file_unlock(SpikeDB* db) {
 #endif
 }
 
+const SpikeDB_IoOps spike_db_internal_io_os = {
+    io_read_os, io_write_os, io_fsync_os, file_lock_os, file_unlock_os, NULL
+};
+
+const SpikeDB_IoOps* spike_db_internal_set_io(SpikeDB* db, const SpikeDB_IoOps* ops) {
+    if (!db) return NULL;
+    const SpikeDB_IoOps* prev = db->io;
+    db->io = ops ? ops : &spike_db_internal_io_os;
+    return prev;
+}
+
+void* spike_db_internal_io_ctx(SpikeDB* db) {
+    return db ? db->io->ctx : NULL;
+}
+
+static SpikeDB_Status file_lock(SpikeDB* db, bool exclusive) {
+    return db->io->lock(db, exclusive);
+}
+
+static void file_unlock(SpikeDB* db) {
+    db->io->unlock(db);
+}
+
+static SpikeDB_Status meta_validate(const MetaPage* m) {
+    if (m->magic != SPIKEDB_MAGIC) return SPIKEDB_CORRUPT;
+    uint32_t want = crc32_compute(m, sizeof(MetaPage) - sizeof(uint32_t));
+    if (m->crc32 != want) return SPIKEDB_CORRUPT;
+    return SPIKEDB_OK;
+}
+
 /* Re-read both meta pages from disk and pick the one with the higher
  * valid txn_id. If active_meta changed (another writer committed),
  * invalidate all clean unpinned cache slots since their content may
@@ -424,10 +601,8 @@ static SpikeDB_Status db_refresh_meta(SpikeDB* db) {
 
     int new_active;
     uint64_t new_txn;
-    bool va = (a.magic == SPIKEDB_MAGIC)
-            && (crc32_compute(&a, sizeof(MetaPage) - sizeof(uint32_t)) == a.crc32);
-    bool vb = (b.magic == SPIKEDB_MAGIC)
-            && (crc32_compute(&b, sizeof(MetaPage) - sizeof(uint32_t)) == b.crc32);
+    bool va = meta_validate(&a) == SPIKEDB_OK;
+    bool vb = meta_validate(&b) == SPIKEDB_OK;
     if (!va && !vb) return SPIKEDB_CORRUPT;
     if (va && vb) { new_active = (a.txn_id >= b.txn_id) ? 0 : 1; }
     else { new_active = va ? 0 : 1; }
@@ -461,6 +636,23 @@ static SpikeDB_Status db_refresh_meta(SpikeDB* db) {
  *============================================================================*/
 
 #define HT_EMPTY  0xFFFFFFFFu
+
+/* Stamp the trailer and write. Every data page goes out through here so
+ * there is exactly one place that can forget the checksum. */
+static SpikeDB_Status page_write_checked(SpikeDB* db, uint32_t page_id, uint8_t* bytes) {
+    uint32_t crc = crc32_compute(bytes, SPDB_PAGE_BODY);
+    memcpy(bytes + SPDB_PAGE_CRC_OFF, &crc, 4);
+    return io_write(db, page_id, bytes);
+}
+
+static SpikeDB_Status page_read_checked(SpikeDB* db, uint32_t page_id, uint8_t* bytes) {
+    if (io_read(db, page_id, bytes) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    uint32_t stored;
+    memcpy(&stored, bytes + SPDB_PAGE_CRC_OFF, 4);
+    if (stored != crc32_compute(bytes, SPDB_PAGE_BODY))
+        return set_err(db, SPIKEDB_CORRUPT, 0, page_id, "page checksum mismatch");
+    return SPIKEDB_OK;
+}
 
 static uint32_t ht_probe(const SpikeDB* db, uint32_t page_id) {
     uint32_t mask = db->ht_mask;
@@ -530,7 +722,7 @@ static uint32_t cache_evict(SpikeDB* db) {
                  * pre-txn copy that rollback / a concurrent reader's old
                  * meta still needs. */
                 if (!s->fresh) continue;
-                if (io_write(db, s->page_id, s->bytes) != SPIKEDB_OK)
+                if (page_write_checked(db, s->page_id, s->bytes) != SPIKEDB_OK)
                     continue;                   /* I/O error: try next */
                 s->dirty = false;
                 db->cache_spills++;
@@ -560,7 +752,7 @@ static uint8_t* page_pin(SpikeDB* db, uint32_t page_id) {
     uint32_t s = cache_evict(db);
     if (s == UINT32_MAX) { db->cache_oom = true; return NULL; }
     CacheSlot* slot = &db->slots[s];
-    if (io_read(db, page_id, slot->bytes) != SPIKEDB_OK) return NULL;
+    if (page_read_checked(db, page_id, slot->bytes) != SPIKEDB_OK) return NULL;
     slot->page_id   = page_id;
     slot->pin_count = 1;
     slot->dirty     = false;
@@ -613,9 +805,9 @@ static void page_dirty(SpikeDB* db, uint32_t page_id) {
 }
 
 /* Flush all dirty pages, sorted by page id so the kernel/storage sees
- * sequential writes and can coalesce them. With v5's typical 32-128 dirty
- * pages per batch, this is a meaningful win over the previous
- * iteration-order flush. */
+ * sequential writes and can coalesce them. With a typical 32-128 dirty
+ * pages per batch, this is a meaningful win over an iteration-order
+ * flush. */
 static SpikeDB_Status cache_flush_all(SpikeDB* db) {
     /* Encode (page_id<<32)|slot_idx so a single u64 sort produces both
      * a page-ordered traversal and the slot index to look up bytes. */
@@ -654,7 +846,7 @@ static SpikeDB_Status cache_flush_all(SpikeDB* db) {
     for (uint32_t i = 0; i < count; i++) {
         uint32_t s = (uint32_t)(keys[i] & 0xFFFFFFFFu);
         CacheSlot* slot = &db->slots[s];
-        if (io_write(db, slot->page_id, slot->bytes) != SPIKEDB_OK) {
+        if (page_write_checked(db, slot->page_id, slot->bytes) != SPIKEDB_OK) {
             rv = SPIKEDB_ERROR;
             break;
         }
@@ -798,12 +990,40 @@ static SpikeDB_Status meta_write(SpikeDB* db, int which) {
     return io_write(db, which == 0 ? SPIKEDB_META_A_PAGE : SPIKEDB_META_B_PAGE, m);
 }
 
-static SpikeDB_Status txn_commit(SpikeDB* db) {
+/* Abandon the in-flight transaction and re-synchronize the handle with what
+ * is actually on disk.
+ *
+ * The writer mutates the *active* meta in place (bump pointer, freelist head,
+ * symbol count), so dropping the dirty pages is not enough: those mutations
+ * describe pages that were never published. Re-reading both meta pages puts
+ * the handle back on whatever the file really says, which is also the right
+ * answer when a commit failed *after* the new meta reached the disk. */
+static void txn_discard(SpikeDB* db) {
+    cache_discard_dirty(db);
+
+    MetaPage a, b;
+    if (io_read(db, SPIKEDB_META_A_PAGE, &a) == SPIKEDB_OK
+        && io_read(db, SPIKEDB_META_B_PAGE, &b) == SPIKEDB_OK) {
+        bool va = meta_validate(&a) == SPIKEDB_OK;
+        bool vb = meta_validate(&b) == SPIKEDB_OK;
+        if (va || vb) {
+            db->meta_buf[0] = a;
+            db->meta_buf[1] = b;
+            db->active_meta = (va && vb) ? ((a.txn_id >= b.txn_id) ? 0 : 1)
+                                         : (va ? 0 : 1);
+        }
+    }
+
+    db->in_txn = false;
+    db->txn_allocated_count = 0;
+}
+
+static SpikeDB_Status txn_commit_ex(SpikeDB* db, bool sync) {
     if (!db->in_txn) return SPIKEDB_ERROR;
     /* 1. Flush all dirty data pages */
     if (cache_flush_all(db) != SPIKEDB_OK) goto fail;
     /* 2. fsync to make data durable */
-    if (io_fsync(db) != SPIKEDB_OK) goto fail;
+    if (sync && io_fsync(db) != SPIKEDB_OK) goto fail;
     /* 3. Bump txn_id, copy active -> inactive, write inactive meta */
     int new_active = 1 - db->active_meta;
     db->meta_buf[new_active] = db->meta_buf[db->active_meta];
@@ -811,49 +1031,88 @@ static SpikeDB_Status txn_commit(SpikeDB* db) {
     db->meta_buf[new_active].reader_epoch++;
     if (meta_write(db, new_active) != SPIKEDB_OK) goto fail;
     /* 4. fsync meta */
-    if (io_fsync(db) != SPIKEDB_OK) goto fail;
+    if (sync && io_fsync(db) != SPIKEDB_OK) goto fail;
     /* 5. Flip in-memory active marker */
     db->active_meta = new_active;
     db->in_txn = false;
     db->txn_allocated_count = 0;
     return SPIKEDB_OK;
 fail:
-    /* Treat as rollback */
-    cache_discard_dirty(db);
-    db->in_txn = false;
-    db->txn_allocated_count = 0;
+    txn_discard(db);
     return SPIKEDB_ERROR;
+}
+
+static SpikeDB_Status txn_commit(SpikeDB* db) {
+    return txn_commit_ex(db, true);
 }
 
 static void txn_rollback(SpikeDB* db) {
     if (!db->in_txn) return;
-    cache_discard_dirty(db);
-    /* Allocated pages would have come from freelist or bump; since we
-     * discard the dirty meta, the freelist/bump is unchanged in *memory*
-     * if we revert the active meta. We work on active meta in place,
-     * so we must restore the bump pointer and freelist. To keep this
-     * simple, we re-read meta from disk. */
-    MetaPage tmp;
-    if (io_read(db, db->active_meta == 0 ? SPIKEDB_META_A_PAGE
-                                          : SPIKEDB_META_B_PAGE, &tmp) == SPIKEDB_OK) {
-        db->meta_buf[db->active_meta] = tmp;
-    }
-    db->in_txn = false;
-    db->txn_allocated_count = 0;
+    txn_discard(db);
 }
 
 /*============================================================================
  * Symbol directory (open-addressing hash, reserved pages)
  *============================================================================*/
 
-#define SYMDIR_TOTAL_SLOTS  (SPIKEDB_SYMDIR_PAGES * (SPIKEDB_PAGE_SIZE / sizeof(SymDirSlot)))
+#define SYMDIR_SLOTS_PER_PAGE  (SPDB_PAGE_BODY / (uint32_t)sizeof(SymDirSlot))
+#define SYMDIR_TOTAL_SLOTS     (SPIKEDB_SYMDIR_PAGES * SYMDIR_SLOTS_PER_PAGE)
+
+SPDB_STATIC_ASSERT(SYMDIR_SLOTS_PER_PAGE * sizeof(SymDirSlot) <= SPDB_PAGE_BODY,
+                   symdir_page_fits);
 
 static void symdir_locate(uint64_t symbol, uint32_t* out_page, uint32_t* out_slot) {
     uint64_t h = mix64(symbol);
     uint32_t global = (uint32_t)(h % SYMDIR_TOTAL_SLOTS);
-    uint32_t per_pg = SPIKEDB_PAGE_SIZE / (uint32_t)sizeof(SymDirSlot);
+    uint32_t per_pg = SYMDIR_SLOTS_PER_PAGE;
     *out_page = SPIKEDB_SYMDIR_START + (global / per_pg);
     *out_slot = global % per_pg;
+}
+
+/* A dropped symbol leaves a tombstone: clearing the slot outright would
+ * break the probe chain of any symbol that collided with it. */
+#define SYMDIR_TOMBSTONE  SPIKEDB_INVALID_PAGE
+
+static bool symdir_slot_empty(const SymDirSlot* s) {
+    return s->root_page == 0 && s->symbol == 0;
+}
+static bool symdir_slot_live(const SymDirSlot* s) {
+    return !symdir_slot_empty(s) && s->root_page != SYMDIR_TOMBSTONE;
+}
+
+static SpikeDB_Status symdir_create(SpikeDB* db, uint64_t symbol,
+                                    uint32_t pg, uint32_t slot,
+                                    uint32_t* out_root) {
+    uint32_t root_pg;
+    if (page_alloc(db, &root_pg) != SPIKEDB_OK) return SPIKEDB_ERROR;
+
+    uint8_t* rb = page_pin_zero(db, root_pg);
+    if (!rb) return SPIKEDB_ERROR;
+    SymbolRootPage* root = (SymbolRootPage*)rb;
+    root->symbol            = symbol;
+    root->min_time          = UINT64_MAX;
+    root->max_time          = 0;
+    root->record_count      = 0;
+    root->leaf_count        = 0;
+    root->first_leaf        = SPIKEDB_INVALID_PAGE;
+    root->last_leaf         = SPIKEDB_INVALID_PAGE;
+    root->current_max_level = 1;
+    root->rng_state         = (uint32_t)mix64(symbol ^ 0xC0FFEEULL);
+    root->current_node_page = SPIKEDB_INVALID_PAGE;
+    for (int i = 0; i < SPIKEDB_MAX_LEVEL; i++) root->head_forward[i] = NODE_REF_NIL;
+    page_unpin(db, root_pg);
+
+    uint8_t* bytes = page_pin(db, pg);
+    if (!bytes) return SPIKEDB_ERROR;
+    SymDirSlot* s = (SymDirSlot*)bytes + slot;
+    s->symbol    = symbol;
+    s->root_page = root_pg;
+    page_dirty(db, pg);
+    page_unpin(db, pg);
+
+    db->meta_buf[db->active_meta].symbol_count++;
+    *out_root = root_pg;
+    return SPIKEDB_OK;
 }
 
 /* Linear-probe to find slot. Returns root_page or INVALID. */
@@ -861,58 +1120,36 @@ static SpikeDB_Status symdir_lookup(SpikeDB* db, uint64_t symbol,
                                     uint32_t* out_root, bool create_ok) {
     uint32_t pg, slot;
     symdir_locate(symbol, &pg, &slot);
-    uint32_t per_pg = SPIKEDB_PAGE_SIZE / (uint32_t)sizeof(SymDirSlot);
+    uint32_t per_pg = SYMDIR_SLOTS_PER_PAGE;
     uint64_t probes = 0;
+    uint32_t reuse_pg = SPIKEDB_INVALID_PAGE, reuse_slot = 0;
 
     while (probes < SYMDIR_TOTAL_SLOTS) {
         uint8_t* bytes = page_pin(db, pg);
         if (!bytes) return SPIKEDB_ERROR;
         SymDirSlot* s = (SymDirSlot*)bytes + slot;
 
-        if (s->root_page == 0 && s->symbol == 0) {
-            /* Empty */
+        if (s->root_page == SYMDIR_TOMBSTONE && s->symbol != symbol) {
+            if (reuse_pg == SPIKEDB_INVALID_PAGE) { reuse_pg = pg; reuse_slot = slot; }
+            page_unpin(db, pg);
+        } else if (symdir_slot_empty(s)) {
             if (!create_ok) {
                 page_unpin(db, pg);
                 return SPIKEDB_NOT_FOUND;
             }
-            /* Create new SymbolRoot page */
-            uint32_t root_pg;
-            if (page_alloc(db, &root_pg) != SPIKEDB_OK) {
-                page_unpin(db, pg);
-                return SPIKEDB_ERROR;
-            }
-            uint8_t* rb = page_pin_zero(db, root_pg);
-            if (!rb) { page_unpin(db, pg); return SPIKEDB_ERROR; }
-            SymbolRootPage* root = (SymbolRootPage*)rb;
-            root->symbol            = symbol;
-            root->min_time          = UINT64_MAX;
-            root->max_time          = 0;
-            root->record_count      = 0;
-            root->leaf_count        = 0;
-            root->first_leaf        = SPIKEDB_INVALID_PAGE;
-            root->last_leaf         = SPIKEDB_INVALID_PAGE;
-            root->current_max_level = 1;
-            root->rng_state         = (uint32_t)mix64(symbol ^ 0xC0FFEEULL);
-            root->current_node_page = SPIKEDB_INVALID_PAGE;
-            for (int i = 0; i < SPIKEDB_MAX_LEVEL; i++) root->head_forward[i] = NODE_REF_NIL;
-            page_unpin(db, root_pg);
-
-            s->symbol    = symbol;
-            s->root_page = root_pg;
-            page_dirty(db, pg);
             page_unpin(db, pg);
-
-            db->meta_buf[db->active_meta].symbol_count++;
-            *out_root = root_pg;
-            return SPIKEDB_OK;
-        }
-        if (s->symbol == symbol) {
+            /* Prefer an earlier tombstone so the table does not fill up. */
+            if (reuse_pg != SPIKEDB_INVALID_PAGE) { pg = reuse_pg; slot = reuse_slot; }
+            return symdir_create(db, symbol, pg, slot, out_root);
+        } else if (s->symbol == symbol && s->root_page != SYMDIR_TOMBSTONE) {
             uint32_t root = s->root_page;
             page_unpin(db, pg);
             *out_root = root;
             return SPIKEDB_OK;
+        } else {
+            page_unpin(db, pg);
         }
-        page_unpin(db, pg);
+
         /* Linear probe to next slot */
         slot++;
         if (slot == per_pg) { slot = 0; pg++; if (pg >= SPIKEDB_SYMDIR_START + SPIKEDB_SYMDIR_PAGES) pg = SPIKEDB_SYMDIR_START; }
@@ -963,7 +1200,7 @@ static SpikeDB_Status node_alloc_in_root(SpikeDB* db, uint32_t root_pg,
     if (!b) { page_unpin(db, root_pg); return SPIKEDB_ERROR; }
     NodePageHeader* h = (NodePageHeader*)b;
     h->used_count = 1;
-    h->next_node_page = SPIKEDB_INVALID_PAGE;
+    h->next_node_page = root->current_node_page;   /* chain, so drop can free them */
     page_unpin(db, pg);
 
     root->current_node_page = pg;
@@ -1014,8 +1251,12 @@ typedef struct DescentResult {
     uint32_t leaf_page;                     /* INVALID if no leaf <= time */
 } DescentResult;
 
-static SpikeDB_Status descend(SpikeDB* db, uint32_t root_pg, uint64_t time,
-                              DescentResult* out) {
+/* `strict` makes the walk stop at the first node whose key is >= the
+ * target rather than > it, so pred_ref[] holds the predecessors of the
+ * node with exactly that key — what skiplist_unlink needs. */
+static SpikeDB_Status descend_ex(SpikeDB* db, uint32_t root_pg,
+                                 uint64_t time, uint32_t seq, bool strict,
+                                 DescentResult* out) {
     uint8_t* rb = page_pin(db, root_pg);
     if (!rb) return SPIKEDB_ERROR;
     SymbolRootPage* root = (SymbolRootPage*)rb;
@@ -1045,8 +1286,9 @@ static SpikeDB_Status descend(SpikeDB* db, uint32_t root_pg, uint64_t time,
             SkipNode* nn = node_load(db, next_ref, &np);
             if (!nn) { page_unpin(db, root_pg); return SPIKEDB_ERROR; }
             uint64_t ft = nn->first_time;
+            uint32_t fs = nn->first_seq;
             page_unpin(db, np);
-            if (ft > time) break;
+            if (key_cmp(ft, fs, time, seq) > (strict ? -1 : 0)) break;
             curr_ref = next_ref;
         }
         out->pred_ref[level] = curr_ref;
@@ -1066,12 +1308,34 @@ static SpikeDB_Status descend(SpikeDB* db, uint32_t root_pg, uint64_t time,
     return SPIKEDB_OK;
 }
 
+static SpikeDB_Status descend(SpikeDB* db, uint32_t root_pg,
+                              uint64_t time, uint32_t seq,
+                              DescentResult* out) {
+    return descend_ex(db, root_pg, time, seq, false, out);
+}
+
 /*============================================================================
  * Leaf operations
+ *
+ * Everything below works on either layout. Read paths go through
+ * leaf_find / leaf_key_at / leaf_val_at so the rest of the engine does not
+ * need to know which one a leaf uses.
  *============================================================================*/
 
 static LeafSlot* leaf_slots(uint8_t* page) {
     return (LeafSlot*)(page + LEAF_HDR_SIZE);
+}
+
+static uint64_t* leaf_ftimes(uint8_t* page) {
+    return (uint64_t*)(page + LEAF_HDR_SIZE);
+}
+static uint32_t* leaf_fseqs(uint8_t* page) {
+    uint32_t cap = LEAF_FIXED_CAP(((LeafHeader*)page)->record_size);
+    return (uint32_t*)(page + LEAF_HDR_SIZE + (size_t)8u * cap);
+}
+static uint8_t* leaf_fvals(uint8_t* page) {
+    uint32_t cap = LEAF_FIXED_CAP(((LeafHeader*)page)->record_size);
+    return page + LEAF_HDR_SIZE + (size_t)12u * cap;
 }
 
 static uint32_t leaf_free_space(const LeafHeader* h) {
@@ -1080,52 +1344,147 @@ static uint32_t leaf_free_space(const LeafHeader* h) {
     return h->value_heap_bottom - slots_end;
 }
 
-/* Binary search for `time` in a leaf's slot dir. Returns index of first
- * slot whose time >= target, or record_count if none. Sets *exact if found. */
-static uint32_t leaf_search(const LeafHeader* h, const LeafSlot* slots,
-                            uint64_t time, bool* exact) {
-    *exact = false;
+/* Index of the first record whose key >= (time, seq), or record_count. */
+static uint32_t leaf_find(const uint8_t* page, uint64_t time, uint32_t seq,
+                          bool* exact) {
+    const LeafHeader* h = (const LeafHeader*)page;
     uint32_t lo = 0, hi = h->record_count;
+    *exact = false;
+
+    if (h->record_size) {
+        const uint64_t* ts = (const uint64_t*)(page + LEAF_HDR_SIZE);
+        uint32_t cap = LEAF_FIXED_CAP(h->record_size);
+        const uint32_t* sq = (const uint32_t*)(page + LEAF_HDR_SIZE + (size_t)8u * cap);
+        while (lo < hi) {
+            uint32_t mid = (lo + hi) >> 1;
+            if (key_cmp(ts[mid], sq[mid], time, seq) < 0) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < h->record_count && ts[lo] == time && sq[lo] == seq) *exact = true;
+        return lo;
+    }
+
+    const LeafSlot* slots = (const LeafSlot*)(page + LEAF_HDR_SIZE);
     while (lo < hi) {
         uint32_t mid = (lo + hi) >> 1;
-        if (slots[mid].time < time) lo = mid + 1;
+        if (key_cmp(slots[mid].time, slots[mid].seq, time, seq) < 0) lo = mid + 1;
         else hi = mid;
     }
-    if (lo < h->record_count && slots[lo].time == time) *exact = true;
+    if (lo < h->record_count && slots[lo].time == time && slots[lo].seq == seq)
+        *exact = true;
     return lo;
 }
 
-/* Initialize a fresh leaf */
-static void leaf_init(uint8_t* page, uint64_t symbol) {
+static void leaf_key_at(const uint8_t* page, uint32_t i,
+                        uint64_t* time_out, uint32_t* seq_out) {
+    const LeafHeader* h = (const LeafHeader*)page;
+    if (h->record_size) {
+        uint32_t cap = LEAF_FIXED_CAP(h->record_size);
+        *time_out = ((const uint64_t*)(page + LEAF_HDR_SIZE))[i];
+        *seq_out  = ((const uint32_t*)(page + LEAF_HDR_SIZE + (size_t)8u * cap))[i];
+    } else {
+        const LeafSlot* s = &((const LeafSlot*)(page + LEAF_HDR_SIZE))[i];
+        *time_out = s->time;
+        *seq_out  = s->seq;
+    }
+}
+
+static const uint8_t* leaf_val_at(const uint8_t* page, uint32_t i, uint32_t* len_out) {
+    const LeafHeader* h = (const LeafHeader*)page;
+    if (h->record_size) {
+        uint32_t cap = LEAF_FIXED_CAP(h->record_size);
+        *len_out = h->record_size;
+        return page + LEAF_HDR_SIZE + (size_t)12u * cap + (size_t)i * h->record_size;
+    }
+    const LeafSlot* s = &((const LeafSlot*)(page + LEAF_HDR_SIZE))[i];
+    *len_out = s->value_len;
+    return page + s->value_offset;
+}
+
+static void leaf_init(uint8_t* page, uint64_t symbol, uint32_t record_size) {
     LeafHeader* h = (LeafHeader*)page;
     memset(page, 0, SPIKEDB_PAGE_SIZE);
     h->symbol            = symbol;
     h->min_time          = UINT64_MAX;
     h->max_time          = 0;
     h->record_count      = 0;
-    h->value_heap_bottom = SPIKEDB_PAGE_SIZE;
+    h->record_size       = record_size;
+    h->value_heap_bottom = SPDB_PAGE_BODY;
     h->prev_leaf         = SPIKEDB_INVALID_PAGE;
     h->next_leaf         = SPIKEDB_INVALID_PAGE;
     h->skiplist_node_ref = NODE_REF_NIL;
 }
 
-/* Try to insert (time, value) into an existing leaf. Returns:
- *   SPIKEDB_OK    — inserted
+/* Try to insert (time, seq, value) into an existing leaf. With `overwrite`,
+ * an existing key is replaced instead of rejected and *replaced is set.
+ * Returns:
+ *   SPIKEDB_OK    — inserted or replaced
  *   SPIKEDB_FULL  — caller must split
- *   SPIKEDB_INVAL — duplicate (currently rejected)
+ *   SPIKEDB_INVAL — duplicate and overwrite not requested, or a value whose
+ *                   length does not match the symbol's declared record size
  */
-static SpikeDB_Status leaf_insert(uint8_t* page, uint64_t time,
-                                  const void* value, size_t vlen) {
+static SpikeDB_Status leaf_upsert(uint8_t* page, uint64_t time, uint32_t seq,
+                                  const void* value, size_t vlen,
+                                  bool overwrite, bool* replaced) {
     LeafHeader* h = (LeafHeader*)page;
-    LeafSlot*   slots = leaf_slots(page);
+    *replaced = false;
+
+    bool exact;
+    uint32_t pos = leaf_find(page, time, seq, &exact);
+
+    if (h->record_size) {
+        uint32_t R = h->record_size;
+        if (vlen != R) return SPIKEDB_INVAL;
+        uint64_t* ts = leaf_ftimes(page);
+        uint32_t* sq = leaf_fseqs(page);
+        uint8_t*  vs = leaf_fvals(page);
+
+        if (exact) {
+            if (!overwrite) return SPIKEDB_INVAL;
+            memcpy(vs + (size_t)pos * R, value, R);
+            *replaced = true;
+            return SPIKEDB_OK;
+        }
+        if (h->record_count >= LEAF_FIXED_CAP(R)) return SPIKEDB_FULL;
+
+        uint32_t tail = h->record_count - pos;
+        if (tail) {
+            memmove(&ts[pos + 1], &ts[pos], (size_t)tail * 8);
+            memmove(&sq[pos + 1], &sq[pos], (size_t)tail * 4);
+            memmove(vs + (size_t)(pos + 1) * R, vs + (size_t)pos * R,
+                    (size_t)tail * R);
+        }
+        ts[pos] = time;
+        sq[pos] = seq;
+        memcpy(vs + (size_t)pos * R, value, R);
+        h->record_count++;
+        if (time < h->min_time) h->min_time = time;
+        if (time > h->max_time) h->max_time = time;
+        return SPIKEDB_OK;
+    }
+
+    LeafSlot* slots = leaf_slots(page);
+
+    if (exact) {
+        if (!overwrite) return SPIKEDB_INVAL;
+        LeafSlot* s = &slots[pos];
+        if (vlen <= s->value_len) {
+            /* Shrinking leaves a hole; the next leaf_compact reclaims it. */
+            memcpy(page + s->value_offset, value, vlen);
+        } else {
+            if (leaf_free_space(h) < vlen) return SPIKEDB_FULL;
+            h->value_heap_bottom -= (uint32_t)vlen;
+            memcpy(page + h->value_heap_bottom, value, vlen);
+            s->value_offset = h->value_heap_bottom;
+        }
+        s->value_len = (uint16_t)vlen;
+        *replaced = true;
+        return SPIKEDB_OK;
+    }
 
     /* Need room for one slot + vlen bytes */
     uint32_t needed = (uint32_t)(LEAF_SLOT_SIZE + vlen);
     if (leaf_free_space(h) < needed) return SPIKEDB_FULL;
-
-    bool exact;
-    uint32_t pos = leaf_search(h, slots, time, &exact);
-    if (exact) return SPIKEDB_INVAL;   /* duplicate (symbol,time) — reject */
 
     /* Place value */
     h->value_heap_bottom -= (uint32_t)vlen;
@@ -1137,6 +1496,7 @@ static SpikeDB_Status leaf_insert(uint8_t* page, uint64_t time,
                 (h->record_count - pos) * sizeof(LeafSlot));
     }
     slots[pos].time         = time;
+    slots[pos].seq          = seq;
     slots[pos].value_offset = h->value_heap_bottom;
     slots[pos].value_len    = (uint16_t)vlen;
     slots[pos]._pad         = 0;
@@ -1148,10 +1508,71 @@ static SpikeDB_Status leaf_insert(uint8_t* page, uint64_t time,
     return SPIKEDB_OK;
 }
 
-/* Compact a leaf's value heap. Used after a split to reclaim space.
- * Uses db->scratch_page (lazily allocated) to avoid per-call malloc. */
+static SpikeDB_Status leaf_insert(uint8_t* page, uint64_t time, uint32_t seq,
+                                  const void* value, size_t vlen) {
+    bool replaced;
+    return leaf_upsert(page, time, seq, value, vlen, false, &replaced);
+}
+
+/* Drop the first `n` records of a leaf, shifting the rest down. */
+static void leaf_drop_front(uint8_t* page, uint32_t n) {
+    LeafHeader* h = (LeafHeader*)page;
+    uint32_t tail = h->record_count - n;
+    if (h->record_size) {
+        uint32_t R = h->record_size;
+        uint64_t* ts = leaf_ftimes(page);
+        uint32_t* sq = leaf_fseqs(page);
+        uint8_t*  vs = leaf_fvals(page);
+        memmove(ts, &ts[n], (size_t)tail * 8);
+        memmove(sq, &sq[n], (size_t)tail * 4);
+        memmove(vs, vs + (size_t)n * R, (size_t)tail * R);
+    } else {
+        LeafSlot* ls = leaf_slots(page);
+        memmove(&ls[0], &ls[n], (size_t)tail * sizeof(LeafSlot));
+    }
+    h->record_count = tail;
+}
+
+/* Remove one record. */
+static void leaf_erase(uint8_t* page, uint32_t pos) {
+    LeafHeader* h = (LeafHeader*)page;
+    uint32_t tail = h->record_count - pos - 1;
+    if (h->record_size) {
+        uint32_t R = h->record_size;
+        uint64_t* ts = leaf_ftimes(page);
+        uint32_t* sq = leaf_fseqs(page);
+        uint8_t*  vs = leaf_fvals(page);
+        memmove(&ts[pos], &ts[pos + 1], (size_t)tail * 8);
+        memmove(&sq[pos], &sq[pos + 1], (size_t)tail * 4);
+        memmove(vs + (size_t)pos * R, vs + (size_t)(pos + 1) * R, (size_t)tail * R);
+    } else {
+        LeafSlot* ls = leaf_slots(page);
+        memmove(&ls[pos], &ls[pos + 1], (size_t)tail * sizeof(LeafSlot));
+    }
+    h->record_count--;
+}
+
+/* Refresh min_time/max_time from the records actually present. */
+static void leaf_refresh_bounds(uint8_t* page) {
+    LeafHeader* h = (LeafHeader*)page;
+    if (h->record_count == 0) {
+        h->min_time = UINT64_MAX;
+        h->max_time = 0;
+        h->value_heap_bottom = SPDB_PAGE_BODY;
+        return;
+    }
+    uint64_t t; uint32_t s;
+    leaf_key_at(page, 0, &t, &s);
+    h->min_time = t;
+    leaf_key_at(page, h->record_count - 1, &t, &s);
+    h->max_time = t;
+}
+
+/* Compact a variable-width leaf's value heap. No-op for fixed-width leaves,
+ * which cannot fragment. Uses db->scratch_page to avoid a per-call malloc. */
 static SpikeDB_Status leaf_compact(SpikeDB* db, uint8_t* page) {
     LeafHeader* h = (LeafHeader*)page;
+    if (h->record_size) return SPIKEDB_OK;
     LeafSlot*   slots = leaf_slots(page);
     if (!db->scratch_page) {
 #ifdef _WIN32
@@ -1163,14 +1584,14 @@ static SpikeDB_Status leaf_compact(SpikeDB* db, uint8_t* page) {
         if (!db->scratch_page) return SPIKEDB_ERROR;
     }
     uint8_t* tmp = db->scratch_page;
-    uint32_t cursor = SPIKEDB_PAGE_SIZE;
+    uint32_t cursor = SPDB_PAGE_BODY;
     for (uint32_t i = 0; i < h->record_count; i++) {
         uint16_t vl = slots[i].value_len;
         cursor -= vl;
         memcpy(tmp + cursor, page + slots[i].value_offset, vl);
         slots[i].value_offset = cursor;
     }
-    memcpy(page + cursor, tmp + cursor, SPIKEDB_PAGE_SIZE - cursor);
+    memcpy(page + cursor, tmp + cursor, SPDB_PAGE_BODY - cursor);
     h->value_heap_bottom = cursor;
     return SPIKEDB_OK;
 }
@@ -1183,7 +1604,8 @@ static SpikeDB_Status leaf_compact(SpikeDB* db, uint8_t* page) {
  * predecessor refs from a prior descend(). */
 static SpikeDB_Status skiplist_splice(SpikeDB* db, uint32_t root_pg,
                                       const DescentResult* desc, int level,
-                                      uint64_t first_time, uint32_t leaf_pg,
+                                      uint64_t first_time, uint32_t first_seq,
+                                      uint32_t leaf_pg,
                                       uint64_t* out_new_ref) {
     uint64_t new_ref;
     if (node_alloc_in_root(db, root_pg, &new_ref) != SPIKEDB_OK) return SPIKEDB_ERROR;
@@ -1194,6 +1616,7 @@ static SpikeDB_Status skiplist_splice(SpikeDB* db, uint32_t root_pg,
         SkipNode* nn = node_load(db, new_ref, &np);
         if (!nn) return SPIKEDB_ERROR;
         nn->first_time = first_time;
+        nn->first_seq  = first_seq;
         nn->leaf_page  = leaf_pg;
         nn->level      = (uint8_t)level;
         for (int i = 0; i < SPIKEDB_MAX_LEVEL; i++) nn->forward[i] = NODE_REF_NIL;
@@ -1257,7 +1680,9 @@ static SpikeDB_Status skiplist_splice(SpikeDB* db, uint32_t root_pg,
  *============================================================================*/
 
 static SpikeDB_Status symbol_insert(SpikeDB* db, uint32_t root_pg,
-                                    uint64_t time, const void* value, size_t vlen);
+                                    uint64_t time, uint32_t seq,
+                                    const void* value, size_t vlen,
+                                    bool overwrite, bool* replaced);
 
 /* Split a leaf into two equal halves around the median, return new leaf id. */
 static SpikeDB_Status leaf_split(SpikeDB* db, uint32_t root_pg, uint32_t leaf_pg,
@@ -1265,9 +1690,6 @@ static SpikeDB_Status leaf_split(SpikeDB* db, uint32_t root_pg, uint32_t leaf_pg
     uint8_t* lb = page_pin(db, leaf_pg);
     if (!lb) return SPIKEDB_ERROR;
     LeafHeader* lh = (LeafHeader*)lb;
-    LeafSlot*   ls = leaf_slots(lb);
-    uint32_t    sym_lo = (uint32_t)lh->symbol;
-    SPDB_UNUSED(sym_lo);
 
     uint32_t mid = lh->record_count / 2;
 
@@ -1276,33 +1698,36 @@ static SpikeDB_Status leaf_split(SpikeDB* db, uint32_t root_pg, uint32_t leaf_pg
     if (page_alloc(db, &new_pg) != SPIKEDB_OK) { page_unpin(db, leaf_pg); return SPIKEDB_ERROR; }
     uint8_t* nb = page_pin_zero(db, new_pg);
     if (!nb) { page_unpin(db, leaf_pg); return SPIKEDB_ERROR; }
-    leaf_init(nb, lh->symbol);
+    leaf_init(nb, lh->symbol, lh->record_size);
     LeafHeader* nh = (LeafHeader*)nb;
-    LeafSlot*   ns = leaf_slots(nb);
 
-    /* Move slots [mid..count) to new leaf, copying values */
-    for (uint32_t i = mid; i < lh->record_count; i++) {
-        uint16_t vl = ls[i].value_len;
-        nh->value_heap_bottom -= vl;
-        memcpy(nb + nh->value_heap_bottom, lb + ls[i].value_offset, vl);
-        ns[i - mid].time         = ls[i].time;
-        ns[i - mid].value_offset = nh->value_heap_bottom;
-        ns[i - mid].value_len    = vl;
-        ns[i - mid]._pad         = 0;
+    /* Move records [mid..count) to the new leaf. */
+    uint32_t moved = lh->record_count - mid;
+    if (lh->record_size) {
+        uint32_t R = lh->record_size;
+        memcpy(leaf_ftimes(nb), &leaf_ftimes(lb)[mid], (size_t)moved * 8);
+        memcpy(leaf_fseqs(nb),  &leaf_fseqs(lb)[mid],  (size_t)moved * 4);
+        memcpy(leaf_fvals(nb), leaf_fvals(lb) + (size_t)mid * R, (size_t)moved * R);
+    } else {
+        LeafSlot* ls = leaf_slots(lb);
+        LeafSlot* ns = leaf_slots(nb);
+        for (uint32_t i = mid; i < lh->record_count; i++) {
+            uint16_t vl = ls[i].value_len;
+            nh->value_heap_bottom -= vl;
+            memcpy(nb + nh->value_heap_bottom, lb + ls[i].value_offset, vl);
+            ns[i - mid].time         = ls[i].time;
+            ns[i - mid].seq          = ls[i].seq;
+            ns[i - mid].value_offset = nh->value_heap_bottom;
+            ns[i - mid].value_len    = vl;
+            ns[i - mid]._pad         = 0;
+        }
     }
-    nh->record_count = lh->record_count - mid;
-    nh->min_time     = ns[0].time;
-    nh->max_time     = ns[nh->record_count - 1].time;
+    nh->record_count = moved;
+    leaf_refresh_bounds(nb);
 
     /* Truncate old leaf */
     lh->record_count = mid;
-    if (mid > 0) {
-        lh->min_time = ls[0].time;
-        lh->max_time = ls[mid - 1].time;
-    } else {
-        lh->min_time = UINT64_MAX;
-        lh->max_time = 0;
-    }
+    leaf_refresh_bounds(lb);
     if (leaf_compact(db, lb) != SPIKEDB_OK) {
         page_unpin(db, new_pg); page_unpin(db, leaf_pg); return SPIKEDB_ERROR;
     }
@@ -1344,18 +1769,20 @@ static SpikeDB_Status leaf_split(SpikeDB* db, uint32_t root_pg, uint32_t leaf_pg
     int new_level = random_level(root);
     page_unpin(db, root_pg);
 
-    /* Descend with the new leaf's first_time */
+    /* Descend with the new leaf's first key */
     DescentResult d;
     uint64_t new_first;
+    uint32_t new_first_seq;
     {
         uint8_t* nb2 = page_pin(db, new_pg);
         if (!nb2) return SPIKEDB_ERROR;
-        new_first = ((LeafHeader*)nb2)->min_time;
+        leaf_key_at(nb2, 0, &new_first, &new_first_seq);
         page_unpin(db, new_pg);
     }
-    if (descend(db, root_pg, new_first, &d) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (descend(db, root_pg, new_first, new_first_seq, &d) != SPIKEDB_OK) return SPIKEDB_ERROR;
     uint64_t new_ref;
-    if (skiplist_splice(db, root_pg, &d, new_level, new_first, new_pg, &new_ref) != SPIKEDB_OK)
+    if (skiplist_splice(db, root_pg, &d, new_level, new_first, new_first_seq,
+                        new_pg, &new_ref) != SPIKEDB_OK)
         return SPIKEDB_ERROR;
 
     *out_new_leaf_pg = new_pg;
@@ -1363,7 +1790,11 @@ static SpikeDB_Status leaf_split(SpikeDB* db, uint32_t root_pg, uint32_t leaf_pg
 }
 
 static SpikeDB_Status symbol_insert(SpikeDB* db, uint32_t root_pg,
-                                    uint64_t time, const void* value, size_t vlen) {
+                                    uint64_t time, uint32_t seq,
+                                    const void* value, size_t vlen,
+                                    bool overwrite, bool* replaced) {
+    *replaced = false;
+
     /* Empty symbol? */
     {
         uint8_t* rb = page_pin(db, root_pg);
@@ -1375,8 +1806,8 @@ static SpikeDB_Status symbol_insert(SpikeDB* db, uint32_t root_pg,
             if (page_alloc(db, &leaf_pg) != SPIKEDB_OK) { page_unpin(db, root_pg); return SPIKEDB_ERROR; }
             uint8_t* lb = page_pin_zero(db, leaf_pg);
             if (!lb) { page_unpin(db, root_pg); return SPIKEDB_ERROR; }
-            leaf_init(lb, root->symbol);
-            SpikeDB_Status st = leaf_insert(lb, time, value, vlen);
+            leaf_init(lb, root->symbol, root->record_size);
+            SpikeDB_Status st = leaf_insert(lb, time, seq, value, vlen);
             page_dirty(db, leaf_pg);
             page_unpin(db, leaf_pg);
             if (st != SPIKEDB_OK) { page_unpin(db, root_pg); return st; }
@@ -1403,17 +1834,57 @@ static SpikeDB_Status symbol_insert(SpikeDB* db, uint32_t root_pg,
             for (int i = 0; i < SPIKEDB_MAX_LEVEL; i++) d.pred_ref[i] = NODE_REF_NIL;
             d.leaf_page = SPIKEDB_INVALID_PAGE;
             uint64_t new_ref;
-            return skiplist_splice(db, root_pg, &d, new_level, time, leaf_pg, &new_ref);
+            return skiplist_splice(db, root_pg, &d, new_level, time, seq, leaf_pg, &new_ref);
         }
         page_unpin(db, root_pg);
     }
 
+    /* Append fast path. Ingest is overwhelmingly sorted, so try the tail
+     * leaf before paying for a descent. */
+    {
+        uint32_t tail;
+        {
+            uint8_t* rb = page_pin(db, root_pg);
+            if (!rb) return SPIKEDB_ERROR;
+            tail = ((SymbolRootPage*)rb)->last_leaf;
+            page_unpin(db, root_pg);
+        }
+        if (tail != SPIKEDB_INVALID_PAGE) {
+            uint8_t* tb = page_pin(db, tail);
+            if (!tb) return SPIKEDB_ERROR;
+            LeafHeader* th = (LeafHeader*)tb;
+            bool placed = false;
+            if (th->record_count > 0 && th->next_leaf == SPIKEDB_INVALID_PAGE) {
+                uint64_t lt; uint32_t lsq;
+                leaf_key_at(tb, th->record_count - 1, &lt, &lsq);
+                if (key_cmp(time, seq, lt, lsq) > 0
+                    && leaf_upsert(tb, time, seq, value, vlen,
+                                   overwrite, replaced) == SPIKEDB_OK) {
+                    page_dirty(db, tail);
+                    placed = true;
+                }
+            }
+            page_unpin(db, tail);
+            if (placed) {
+                uint8_t* rb = page_pin(db, root_pg);
+                if (!rb) return SPIKEDB_ERROR;
+                SymbolRootPage* root = (SymbolRootPage*)rb;
+                root->record_count++;
+                if (time < root->min_time) root->min_time = time;
+                if (time > root->max_time) root->max_time = time;
+                page_dirty(db, root_pg);
+                page_unpin(db, root_pg);
+                return SPIKEDB_OK;
+            }
+        }
+    }
+
     /* General case: descend, find target leaf */
     DescentResult d;
-    if (descend(db, root_pg, time, &d) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (descend(db, root_pg, time, seq, &d) != SPIKEDB_OK) return SPIKEDB_ERROR;
     uint32_t leaf_pg = d.leaf_page;
     if (leaf_pg == SPIKEDB_INVALID_PAGE) {
-        /* time < first_leaf.min_time — use first_leaf */
+        /* key precedes the first leaf's first key — use first_leaf */
         uint8_t* rb = page_pin(db, root_pg);
         leaf_pg = ((SymbolRootPage*)rb)->first_leaf;
         page_unpin(db, root_pg);
@@ -1424,19 +1895,30 @@ static SpikeDB_Status symbol_insert(SpikeDB* db, uint32_t root_pg,
     if (!lb) return SPIKEDB_ERROR;
     LeafHeader* lh = (LeafHeader*)lb;
 
-    /* Fast append path: if time > lh->max_time AND this is the last leaf,
-     * AND the leaf is full, allocate a new leaf without splitting. */
-    if (lh->record_count > 0 && time > lh->max_time
-        && leaf_free_space(lh) < (LEAF_SLOT_SIZE + vlen)
-        && lh->next_leaf == SPIKEDB_INVALID_PAGE) {
+    bool after_last = false;
+    bool has_room;
+    if (lh->record_count > 0) {
+        uint64_t lt; uint32_t lsq;
+        leaf_key_at(lb, lh->record_count - 1, &lt, &lsq);
+        after_last = key_cmp(time, seq, lt, lsq) > 0;
+    }
+    has_room = lh->record_size
+             ? (lh->record_count < LEAF_FIXED_CAP(lh->record_size))
+             : (leaf_free_space(lh) >= LEAF_SLOT_SIZE + vlen);
+
+    /* Fast append path: if the key sorts after everything in the last leaf
+     * and that leaf is full, start a new leaf instead of splitting. */
+    if (after_last && !has_room && lh->next_leaf == SPIKEDB_INVALID_PAGE) {
+        uint32_t rec_size = lh->record_size;
+        uint64_t sym      = lh->symbol;
         page_unpin(db, leaf_pg);
 
         uint32_t new_pg;
         if (page_alloc(db, &new_pg) != SPIKEDB_OK) return SPIKEDB_ERROR;
         uint8_t* nb = page_pin_zero(db, new_pg);
         if (!nb) return SPIKEDB_ERROR;
-        leaf_init(nb, lh->symbol);
-        SpikeDB_Status st = leaf_insert(nb, time, value, vlen);
+        leaf_init(nb, sym, rec_size);
+        SpikeDB_Status st = leaf_insert(nb, time, seq, value, vlen);
         ((LeafHeader*)nb)->prev_leaf = leaf_pg;
         page_dirty(db, new_pg);
         page_unpin(db, new_pg);
@@ -1462,15 +1944,16 @@ static SpikeDB_Status symbol_insert(SpikeDB* db, uint32_t root_pg,
 
         /* Splice index node */
         DescentResult d2;
-        if (descend(db, root_pg, time, &d2) != SPIKEDB_OK) return SPIKEDB_ERROR;
+        if (descend(db, root_pg, time, seq, &d2) != SPIKEDB_OK) return SPIKEDB_ERROR;
         uint64_t new_ref;
-        return skiplist_splice(db, root_pg, &d2, new_level, time, new_pg, &new_ref);
+        return skiplist_splice(db, root_pg, &d2, new_level, time, seq, new_pg, &new_ref);
     }
 
-    SpikeDB_Status st = leaf_insert(lb, time, value, vlen);
+    SpikeDB_Status st = leaf_upsert(lb, time, seq, value, vlen, overwrite, replaced);
     if (st == SPIKEDB_OK) {
         page_dirty(db, leaf_pg);
         page_unpin(db, leaf_pg);
+        if (*replaced) return SPIKEDB_OK;
         /* Update root */
         uint8_t* rb = page_pin(db, root_pg);
         SymbolRootPage* root = (SymbolRootPage*)rb;
@@ -1495,15 +1978,20 @@ static SpikeDB_Status symbol_insert(SpikeDB* db, uint32_t root_pg,
     uint8_t* lb2 = page_pin(db, leaf_pg);
     LeafHeader* lh2 = (LeafHeader*)lb2;
     uint32_t target = leaf_pg;
-    if (lh2->record_count > 0 && time > lh2->max_time) target = new_pg;
+    if (lh2->record_count > 0) {
+        uint64_t lt; uint32_t lsq;
+        leaf_key_at(lb2, lh2->record_count - 1, &lt, &lsq);
+        if (key_cmp(time, seq, lt, lsq) > 0) target = new_pg;
+    }
     page_unpin(db, leaf_pg);
 
     uint8_t* tb = page_pin(db, target);
     if (!tb) return SPIKEDB_ERROR;
-    SpikeDB_Status st2 = leaf_insert(tb, time, value, vlen);
+    SpikeDB_Status st2 = leaf_upsert(tb, time, seq, value, vlen, overwrite, replaced);
     page_dirty(db, target);
     page_unpin(db, target);
     if (st2 != SPIKEDB_OK) return st2;
+    if (*replaced) return SPIKEDB_OK;
 
     /* Update root */
     uint8_t* rb = page_pin(db, root_pg);
@@ -1517,15 +2005,207 @@ static SpikeDB_Status symbol_insert(SpikeDB* db, uint32_t root_pg,
 }
 
 /*============================================================================
- * Public API: open / close
+ * Delete
  *============================================================================*/
 
-static SpikeDB_Status meta_validate(const MetaPage* m) {
-    if (m->magic != SPIKEDB_MAGIC) return SPIKEDB_CORRUPT;
-    uint32_t want = crc32_compute(m, sizeof(MetaPage) - sizeof(uint32_t));
-    if (m->crc32 != want) return SPIKEDB_CORRUPT;
+/* Unlink a node from every level of the skip list. Node slots are never
+ * recycled, so the slot itself is left behind. */
+static SpikeDB_Status skiplist_unlink(SpikeDB* db, uint32_t root_pg,
+                                      uint64_t node_ref,
+                                      uint64_t first_time, uint32_t first_seq) {
+    if (node_ref == NODE_REF_NIL) return SPIKEDB_OK;
+
+    DescentResult d;
+    if (descend_ex(db, root_pg, first_time, first_seq, true, &d) != SPIKEDB_OK)
+        return SPIKEDB_ERROR;
+
+    int      level = 0;
+    uint64_t fwd[SPIKEDB_MAX_LEVEL];
+    {
+        uint32_t np;
+        SkipNode* nn = node_load(db, node_ref, &np);
+        if (!nn) return SPIKEDB_ERROR;
+        level = nn->level;
+        memcpy(fwd, nn->forward, sizeof(fwd));
+        nn->leaf_page = SPIKEDB_INVALID_PAGE;
+        page_dirty(db, np);
+        page_unpin(db, np);
+    }
+
+    uint8_t* rb = page_pin(db, root_pg);
+    if (!rb) return SPIKEDB_ERROR;
+    SymbolRootPage* root = (SymbolRootPage*)rb;
+
+    for (int i = 0; i < level; i++) {
+        uint64_t pred = d.pred_ref[i];
+        if (pred == NODE_REF_NIL) {
+            if (root->head_forward[i] == node_ref) root->head_forward[i] = fwd[i];
+        } else {
+            uint32_t pp;
+            SkipNode* pn = node_load(db, pred, &pp);
+            if (!pn) { page_unpin(db, root_pg); return SPIKEDB_ERROR; }
+            if (pn->forward[i] == node_ref) {
+                pn->forward[i] = fwd[i];
+                page_dirty(db, pp);
+            }
+            page_unpin(db, pp);
+        }
+    }
+
+    uint8_t mxlvl = 1;
+    for (int i = SPIKEDB_MAX_LEVEL - 1; i >= 0; i--) {
+        if (root->head_forward[i] != NODE_REF_NIL) { mxlvl = (uint8_t)(i + 1); break; }
+    }
+    root->current_max_level = mxlvl;
+    page_dirty(db, root_pg);
+    page_unpin(db, root_pg);
     return SPIKEDB_OK;
 }
+
+/* Drop an emptied leaf from the index, the leaf chain and the file. */
+static SpikeDB_Status leaf_unlink(SpikeDB* db, uint32_t root_pg, uint32_t leaf_pg) {
+    uint32_t prev, next;
+    uint64_t node_ref;
+    {
+        uint8_t* lb = page_pin(db, leaf_pg);
+        if (!lb) return SPIKEDB_ERROR;
+        LeafHeader* lh = (LeafHeader*)lb;
+        prev     = lh->prev_leaf;
+        next     = lh->next_leaf;
+        node_ref = lh->skiplist_node_ref;
+        page_unpin(db, leaf_pg);
+    }
+
+    if (node_ref != NODE_REF_NIL) {
+        uint64_t ft; uint32_t fs;
+        uint32_t np;
+        SkipNode* nn = node_load(db, node_ref, &np);
+        if (!nn) return SPIKEDB_ERROR;
+        ft = nn->first_time;
+        fs = nn->first_seq;
+        page_unpin(db, np);
+        if (skiplist_unlink(db, root_pg, node_ref, ft, fs) != SPIKEDB_OK)
+            return SPIKEDB_ERROR;
+    }
+
+    if (prev != SPIKEDB_INVALID_PAGE) {
+        uint8_t* pb = page_pin(db, prev);
+        if (!pb) return SPIKEDB_ERROR;
+        ((LeafHeader*)pb)->next_leaf = next;
+        page_dirty(db, prev);
+        page_unpin(db, prev);
+    }
+    if (next != SPIKEDB_INVALID_PAGE) {
+        uint8_t* nb = page_pin(db, next);
+        if (!nb) return SPIKEDB_ERROR;
+        ((LeafHeader*)nb)->prev_leaf = prev;
+        page_dirty(db, next);
+        page_unpin(db, next);
+    }
+
+    uint8_t* rb = page_pin(db, root_pg);
+    if (!rb) return SPIKEDB_ERROR;
+    SymbolRootPage* root = (SymbolRootPage*)rb;
+    if (root->first_leaf == leaf_pg) root->first_leaf = next;
+    if (root->last_leaf  == leaf_pg) root->last_leaf  = prev;
+    if (root->leaf_count) root->leaf_count--;
+    page_dirty(db, root_pg);
+    page_unpin(db, root_pg);
+
+    return page_free(db, leaf_pg);
+}
+
+static SpikeDB_Status symbol_delete(SpikeDB* db, uint32_t root_pg,
+                                    uint64_t time, uint32_t seq) {
+    DescentResult d;
+    if (descend(db, root_pg, time, seq, &d) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    uint32_t leaf_pg = d.leaf_page;
+    if (leaf_pg == SPIKEDB_INVALID_PAGE) return SPIKEDB_NOT_FOUND;
+
+    uint8_t* lb = page_pin(db, leaf_pg);
+    if (!lb) return SPIKEDB_ERROR;
+    LeafHeader* lh = (LeafHeader*)lb;
+    bool exact;
+    uint32_t pos = leaf_find(lb, time, seq, &exact);
+    if (!exact) { page_unpin(db, leaf_pg); return SPIKEDB_NOT_FOUND; }
+
+    leaf_erase(lb, pos);
+
+    bool     now_empty = (lh->record_count == 0);
+    uint64_t new_first_time = 0;
+    uint32_t new_first_seq  = 0;
+    leaf_refresh_bounds(lb);
+    if (!now_empty) {
+        leaf_key_at(lb, 0, &new_first_time, &new_first_seq);
+        (void)leaf_compact(db, lb);
+    }
+    uint64_t node_ref = lh->skiplist_node_ref;
+    page_dirty(db, leaf_pg);
+    page_unpin(db, leaf_pg);
+
+    if (now_empty) {
+        if (leaf_unlink(db, root_pg, leaf_pg) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    } else if (pos == 0 && node_ref != NODE_REF_NIL) {
+        /* The leaf's first key moved; its index entry has to follow. */
+        uint32_t np;
+        SkipNode* nn = node_load(db, node_ref, &np);
+        if (!nn) return SPIKEDB_ERROR;
+        nn->first_time = new_first_time;
+        nn->first_seq  = new_first_seq;
+        page_dirty(db, np);
+        page_unpin(db, np);
+    }
+
+    uint8_t* rb = page_pin(db, root_pg);
+    if (!rb) return SPIKEDB_ERROR;
+    SymbolRootPage* root = (SymbolRootPage*)rb;
+    if (root->record_count) root->record_count--;
+    if (root->first_leaf == SPIKEDB_INVALID_PAGE) {
+        root->min_time = UINT64_MAX;
+        root->max_time = 0;
+    } else {
+        uint8_t* fb = page_pin(db, root->first_leaf);
+        if (!fb) { page_unpin(db, root_pg); return SPIKEDB_ERROR; }
+        root->min_time = ((LeafHeader*)fb)->min_time;
+        page_unpin(db, root->first_leaf);
+        uint8_t* xb = page_pin(db, root->last_leaf);
+        if (!xb) { page_unpin(db, root_pg); return SPIKEDB_ERROR; }
+        root->max_time = ((LeafHeader*)xb)->max_time;
+        page_unpin(db, root->last_leaf);
+    }
+    page_dirty(db, root_pg);
+    page_unpin(db, root_pg);
+    return SPIKEDB_OK;
+}
+
+/* Smallest key >= (time, seq) for this symbol. */
+static SpikeDB_Status find_first_ge(SpikeDB* db, uint32_t root_pg,
+                                    uint64_t time, uint32_t seq,
+                                    uint64_t* time_out, uint32_t* seq_out) {
+    DescentResult d;
+    if (descend(db, root_pg, time, seq, &d) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    uint32_t lp = d.leaf_page;
+    while (lp != SPIKEDB_INVALID_PAGE) {
+        uint8_t* lb = page_pin(db, lp);
+        if (!lb) return SPIKEDB_ERROR;
+        LeafHeader* lh = (LeafHeader*)lb;
+        bool exact;
+        uint32_t pos = leaf_find(lb, time, seq, &exact);
+        if (pos < lh->record_count) {
+            leaf_key_at(lb, pos, time_out, seq_out);
+            page_unpin(db, lp);
+            return SPIKEDB_OK;
+        }
+        uint32_t nx = lh->next_leaf;
+        page_unpin(db, lp);
+        lp = nx;
+    }
+    return SPIKEDB_NOT_FOUND;
+}
+
+/*============================================================================
+ * Public API: open / close
+ *============================================================================*/
 
 static SpikeDB_Status db_format_fresh(SpikeDB* db) {
     /* Layout:
@@ -1537,7 +2217,7 @@ static SpikeDB_Status db_format_fresh(SpikeDB* db) {
     uint8_t* zero = (uint8_t*)calloc(1, SPIKEDB_PAGE_SIZE);
     if (!zero) return SPIKEDB_ERROR;
     for (uint32_t p = SPIKEDB_SYMDIR_START; p < SPIKEDB_SYMDIR_START + SPIKEDB_SYMDIR_PAGES; p++) {
-        if (io_write(db, p, zero) != SPIKEDB_OK) { free(zero); return SPIKEDB_ERROR; }
+        if (page_write_checked(db, p, zero) != SPIKEDB_OK) { free(zero); return SPIKEDB_ERROR; }
     }
     free(zero);
 
@@ -1566,6 +2246,8 @@ SpikeDB_Status spike_db_open(SpikeDB** out, const char* path,
     SpikeDB* db = (SpikeDB*)calloc(1, sizeof(SpikeDB));
     if (!db) return SPIKEDB_ERROR;
     db->fd = SPDB_INVALID_FD;
+    db->io = &spike_db_internal_io_os;
+    db->last_error.page = SPIKEDB_INVALID_PAGE;
     db->readonly = (flags & SPIKEDB_OPEN_READONLY) != 0;
 
     /* Open file. In read-only mode we do NOT create a missing file. */
@@ -1632,12 +2314,23 @@ SpikeDB_Status spike_db_open(SpikeDB** out, const char* path,
     }
 
     *out = db;
+    SPDB_AUDIT(db);
     return SPIKEDB_OK;
 
 fail:
     spike_db_close(db);
     return SPIKEDB_ERROR;
 }
+
+SpikeDB_Status spike_db_open_ex(SpikeDB** out, const char* path,
+                                const SpikeDB_Options* opts) {
+    if (!out || !path || !opts) return SPIKEDB_INVAL;
+    if (opts->struct_size < sizeof(uint32_t) * 3) return SPIKEDB_INVAL;
+    return spike_db_open(out, path, opts->cache_pages_64k, opts->flags);
+}
+
+uint32_t spike_db_version(void)        { return 0 * 10000 + 7 * 100 + 0; }
+uint32_t spike_db_format_version(void) { return (uint32_t)(SPIKEDB_MAGIC & 0xFFu); }
 
 void spike_db_close(SpikeDB* db) {
     if (!db) return;
@@ -1670,11 +2363,14 @@ void spike_db_close(SpikeDB* db) {
 }
 
 /*============================================================================
- * Public API: get
+ * Public API: point lookup
  *============================================================================*/
 
-SpikeDB_Status spike_db_get(SpikeDB* db, uint64_t symbol, uint64_t time,
-                            void** value_out, size_t* len_out) {
+/* dir: 0 = exact key, -1 = greatest key <= target, +1 = smallest key >= target */
+static SpikeDB_Status lookup_key(SpikeDB* db, uint64_t symbol,
+                                 uint64_t time, uint32_t seq, int dir,
+                                 uint64_t* time_out, uint32_t* seq_out,
+                                 void** value_out, size_t* len_out) {
     if (!db || !value_out || !len_out) return SPIKEDB_INVAL;
     *value_out = NULL; *len_out = 0;
 
@@ -1686,43 +2382,231 @@ SpikeDB_Status spike_db_get(SpikeDB* db, uint64_t symbol, uint64_t time,
     if (st != SPIKEDB_OK) { file_unlock(db); return st; }
 
     DescentResult d;
-    if (descend(db, root_pg, time, &d) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+    if (descend(db, root_pg, time, seq, &d) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
     uint32_t leaf_pg = d.leaf_page;
     if (leaf_pg == SPIKEDB_INVALID_PAGE) { file_unlock(db); return SPIKEDB_NOT_FOUND; }
 
-    uint8_t* lb = page_pin(db, leaf_pg);
-    if (!lb) { file_unlock(db); return SPIKEDB_ERROR; }
-    LeafHeader* lh = (LeafHeader*)lb;
-    LeafSlot*   ls = leaf_slots(lb);
-    bool exact;
-    uint32_t pos = leaf_search(lh, ls, time, &exact);
-    if (!exact) {
+    /* Neighbouring leaves lie entirely on one side of the target, so the
+     * same search on them lands on slot 0 / the last slot as required. */
+    st = SPIKEDB_NOT_FOUND;
+    while (leaf_pg != SPIKEDB_INVALID_PAGE) {
+        uint8_t* lb = page_pin(db, leaf_pg);
+        if (!lb) { file_unlock(db); return SPIKEDB_ERROR; }
+        LeafHeader* lh = (LeafHeader*)lb;
+        bool exact;
+        uint32_t pos = leaf_find(lb, time, seq, &exact);
+
+        uint32_t hit = UINT32_MAX;
+        if (dir == 0)      { if (exact) hit = pos; }
+        else if (dir > 0)  { if (pos < lh->record_count) hit = pos; }
+        else               { if (exact) hit = pos; else if (pos > 0) hit = pos - 1; }
+
+        if (hit != UINT32_MAX) {
+            uint32_t vl;
+            const uint8_t* val = leaf_val_at(lb, hit, &vl);
+            void* buf = malloc(vl ? vl : 1);
+            if (!buf) { page_unpin(db, leaf_pg); file_unlock(db); return SPIKEDB_ERROR; }
+            memcpy(buf, val, vl);
+            leaf_key_at(lb, hit, time_out ? time_out : &time, seq_out ? seq_out : &seq);
+            *value_out = buf;
+            *len_out   = vl;
+            st = SPIKEDB_OK;
+            page_unpin(db, leaf_pg);
+            break;
+        }
+
+        uint32_t nxt = (dir > 0) ? lh->next_leaf : lh->prev_leaf;
         page_unpin(db, leaf_pg);
-        file_unlock(db);
-        return SPIKEDB_NOT_FOUND;
+        if (dir == 0) break;
+        leaf_pg = nxt;
     }
-    void* buf = malloc(ls[pos].value_len);
-    if (!buf) { page_unpin(db, leaf_pg); file_unlock(db); return SPIKEDB_ERROR; }
-    memcpy(buf, lb + ls[pos].value_offset, ls[pos].value_len);
-    *value_out = buf;
-    *len_out   = ls[pos].value_len;
-    page_unpin(db, leaf_pg);
+
     file_unlock(db);
-    return SPIKEDB_OK;
+    return st;
 }
 
+SpikeDB_Status spike_db_get(SpikeDB* db, uint64_t symbol, uint64_t time,
+                            void** value_out, size_t* len_out) {
+    return lookup_key(db, symbol, time, 0, 0, NULL, NULL, value_out, len_out);
+}
+
+SpikeDB_Status spike_db_get_seq(SpikeDB* db, uint64_t symbol, uint64_t time,
+                                uint32_t seq,
+                                void** value_out, size_t* len_out) {
+    return lookup_key(db, symbol, time, seq, 0, NULL, NULL, value_out, len_out);
+}
+
+SpikeDB_Status spike_db_get_le(SpikeDB* db, uint64_t symbol, uint64_t time,
+                               uint64_t* time_out, uint32_t* seq_out,
+                               void** value_out, size_t* len_out) {
+    return lookup_key(db, symbol, time, UINT32_MAX, -1,
+                      time_out, seq_out, value_out, len_out);
+}
+
+SpikeDB_Status spike_db_get_ge(SpikeDB* db, uint64_t symbol, uint64_t time,
+                               uint64_t* time_out, uint32_t* seq_out,
+                               void** value_out, size_t* len_out) {
+    return lookup_key(db, symbol, time, 0, +1,
+                      time_out, seq_out, value_out, len_out);
+}
+
+static void cursor_seek(SpikeDB* db, uint64_t symbol,
+                        uint64_t time, uint32_t seq, uint64_t time_hi,
+                        uint32_t* out_leaf, uint32_t* out_slot,
+                        uint64_t* out_key_time, uint32_t* out_key_seq);
+
 void spike_db_free(void* ptr) { free(ptr); }
+
+/*============================================================================
+ * Public API: fixed-width symbols
+ *============================================================================*/
+
+SpikeDB_Status spike_db_symbol_define(SpikeDB* db, uint64_t symbol,
+                                      uint32_t record_size) {
+    if (!db) return SPIKEDB_INVAL;
+    if (db->readonly) return SPIKEDB_ERROR;
+    if (record_size == 0 || record_size > LEAF_FIXED_MAX_REC) return SPIKEDB_INVAL;
+    if (LEAF_FIXED_CAP(record_size) < 4) return SPIKEDB_INVAL;
+
+    if (file_lock(db, true) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+    if (txn_begin(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    SpikeDB_Status st = SPIKEDB_OK;
+    uint32_t root_pg;
+    if (symdir_lookup(db, symbol, &root_pg, true) != SPIKEDB_OK) {
+        st = SPIKEDB_FULL;
+        goto fail;
+    }
+    {
+        uint8_t* rb = page_pin(db, root_pg);
+        if (!rb) { st = SPIKEDB_ERROR; goto fail; }
+        SymbolRootPage* root = (SymbolRootPage*)rb;
+        if (root->record_size == record_size) {
+            page_unpin(db, root_pg);            /* idempotent */
+        } else if (root->record_size != 0
+                   || root->record_count > 0
+                   || root->first_leaf != SPIKEDB_INVALID_PAGE) {
+            /* Declared once. Silently switching would let two components
+             * disagree about the record size without anyone noticing. */
+            page_unpin(db, root_pg);
+            st = SPIKEDB_INVAL;
+            goto fail;
+        } else {
+            root->record_size = record_size;
+            page_dirty(db, root_pg);
+            page_unpin(db, root_pg);
+        }
+    }
+
+    {
+        SpikeDB_Status cs = txn_commit(db);
+        file_unlock(db);
+        SPDB_AUDIT(db);
+        return cs;
+    }
+
+fail:
+    {
+        bool oom = db->cache_oom;
+        txn_rollback(db);
+        file_unlock(db);
+        SPDB_AUDIT(db);
+        return oom ? SPIKEDB_FULL : st;
+    }
+}
+
+SpikeDB_Status spike_db_read_range(SpikeDB* db, uint64_t symbol,
+                                   uint64_t time_lo, uint64_t time_hi,
+                                   void* dst, size_t dst_records,
+                                   size_t* count_out) {
+    if (!db || !count_out || time_hi < time_lo) return SPIKEDB_INVAL;
+    if (dst_records && !dst) return SPIKEDB_INVAL;
+    *count_out = 0;
+
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    uint32_t root_pg;
+    SpikeDB_Status st = symdir_lookup(db, symbol, &root_pg, false);
+    if (st != SPIKEDB_OK) { file_unlock(db); return st; }
+
+    uint32_t R;
+    {
+        uint8_t* rb = page_pin(db, root_pg);
+        if (!rb) { file_unlock(db); return SPIKEDB_ERROR; }
+        R = ((SymbolRootPage*)rb)->record_size;
+        page_unpin(db, root_pg);
+    }
+    if (R == 0) { file_unlock(db); return SPIKEDB_INVAL; }   /* variable-width */
+
+    uint32_t leaf, slot;
+    cursor_seek(db, symbol, time_lo, 0, time_hi, &leaf, &slot, NULL, NULL);
+
+    uint8_t*  out       = (uint8_t*)dst;
+    size_t    copied    = 0;
+    bool      counting  = (dst == NULL);
+    bool      truncated = false;
+
+    while (leaf != SPIKEDB_INVALID_PAGE) {
+        uint8_t* lb = page_pin(db, leaf);
+        if (!lb) { file_unlock(db); return SPIKEDB_ERROR; }
+        LeafHeader* lh = (LeafHeader*)lb;
+
+        /* Include every seq at time_hi, up to and including UINT32_MAX. */
+        bool exact;
+        uint32_t end = leaf_find(lb, time_hi, UINT32_MAX, &exact);
+        if (exact) end++;
+        bool last = (end < lh->record_count);
+
+        uint32_t avail = (end > slot) ? end - slot : 0;
+        if (avail) {
+            if (counting) {
+                copied += avail;
+            } else {
+                size_t room = (dst_records > copied) ? dst_records - copied : 0;
+                size_t take = avail;
+                if (take > room) { take = room; truncated = true; }
+                if (take)
+                    memcpy(out + copied * R, leaf_fvals(lb) + (size_t)slot * R,
+                           take * R);
+                copied += take;
+            }
+        }
+
+        uint32_t nx = lh->next_leaf;
+        page_unpin(db, leaf);
+        if (last || truncated) break;
+        leaf = nx;
+        slot = 0;
+    }
+
+    file_unlock(db);
+    *count_out = copied;
+    return truncated ? SPIKEDB_FULL : SPIKEDB_OK;
+}
 
 /*============================================================================
  * Public API: batch
  *============================================================================*/
 
+enum { BATCH_OP_PUT = 0, BATCH_OP_UPSERT = 1, BATCH_OP_DEL = 2 };
+
 typedef struct BatchEntry {
     uint64_t symbol;
     uint64_t time;
+    uint32_t seq;
     uint32_t offset;        /* offset into batch->blob */
     uint32_t length;
+    uint32_t idx;           /* submission order; keeps the sort deterministic */
+    uint8_t  op;
 } BatchEntry;
+
+typedef struct BatchMeta {
+    char*    key;
+    uint8_t* value;
+    size_t   len;
+} BatchMeta;
 
 struct SpikeDB_Batch {
     BatchEntry* entries;
@@ -1731,6 +2615,9 @@ struct SpikeDB_Batch {
     uint8_t*    blob;
     size_t      blob_size;
     size_t      blob_cap;
+    BatchMeta*  meta;
+    size_t      meta_count;
+    size_t      meta_cap;
 };
 
 SpikeDB_Batch* spike_db_batch_create(void) {
@@ -1738,8 +2625,18 @@ SpikeDB_Batch* spike_db_batch_create(void) {
     return b;
 }
 
+static void batch_free_meta(SpikeDB_Batch* b) {
+    for (size_t i = 0; i < b->meta_count; i++) {
+        free(b->meta[i].key);
+        free(b->meta[i].value);
+    }
+    b->meta_count = 0;
+}
+
 void spike_db_batch_destroy(SpikeDB_Batch* b) {
     if (!b) return;
+    batch_free_meta(b);
+    free(b->meta);
     free(b->entries);
     free(b->blob);
     free(b);
@@ -1747,14 +2644,16 @@ void spike_db_batch_destroy(SpikeDB_Batch* b) {
 
 void spike_db_batch_clear(SpikeDB_Batch* b) {
     if (!b) return;
+    batch_free_meta(b);
     b->count = 0;
     b->blob_size = 0;
 }
 
 size_t spike_db_batch_count(const SpikeDB_Batch* b) { return b ? b->count : 0; }
 
-SpikeDB_Status spike_db_batch_put(SpikeDB_Batch* b, uint64_t symbol, uint64_t time,
-                                  const void* value, size_t len) {
+static SpikeDB_Status batch_append(SpikeDB_Batch* b, uint8_t op, uint64_t symbol,
+                                   uint64_t time, uint32_t seq,
+                                   const void* value, size_t len) {
     if (!b || (!value && len > 0)) return SPIKEDB_INVAL;
     if (len > 65000) return SPIKEDB_INVAL;     /* must fit in a leaf */
 
@@ -1771,13 +2670,144 @@ SpikeDB_Status spike_db_batch_put(SpikeDB_Batch* b, uint64_t symbol, uint64_t ti
         if (!nb) return SPIKEDB_ERROR;
         b->blob = nb; b->blob_cap = nc;
     }
-    BatchEntry* e = &b->entries[b->count++];
+    BatchEntry* e = &b->entries[b->count];
     e->symbol = symbol;
     e->time   = time;
+    e->seq    = seq;
     e->offset = (uint32_t)b->blob_size;
     e->length = (uint32_t)len;
+    e->idx    = (uint32_t)b->count;
+    e->op     = op;
+    b->count++;
     if (len) memcpy(b->blob + b->blob_size, value, len);
     b->blob_size += len;
+    return SPIKEDB_OK;
+}
+
+SpikeDB_Status spike_db_batch_put(SpikeDB_Batch* b, uint64_t symbol, uint64_t time,
+                                  const void* value, size_t len) {
+    return batch_append(b, BATCH_OP_PUT, symbol, time, 0, value, len);
+}
+
+SpikeDB_Status spike_db_batch_put_seq(SpikeDB_Batch* b, uint64_t symbol,
+                                      uint64_t time, uint32_t seq,
+                                      const void* value, size_t len) {
+    return batch_append(b, BATCH_OP_PUT, symbol, time, seq, value, len);
+}
+
+SpikeDB_Status spike_db_batch_put_ex(SpikeDB_Batch* b, uint64_t symbol,
+                                     uint64_t time, uint32_t seq,
+                                     const void* value, size_t len,
+                                     uint32_t flags) {
+    uint8_t op = (flags & SPIKEDB_PUT_OVERWRITE) ? BATCH_OP_UPSERT : BATCH_OP_PUT;
+    return batch_append(b, op, symbol, time, seq, value, len);
+}
+
+SpikeDB_Status spike_db_batch_del(SpikeDB_Batch* b, uint64_t symbol,
+                                  uint64_t time, uint32_t seq) {
+    return batch_append(b, BATCH_OP_DEL, symbol, time, seq, NULL, 0);
+}
+
+SpikeDB_Status spike_db_batch_put_meta(SpikeDB_Batch* b, const char* key,
+                                       const void* value, size_t len) {
+    if (!b || !key || (!value && len > 0)) return SPIKEDB_INVAL;
+    size_t klen = strlen(key);
+    if (klen == 0 || klen > 255) return SPIKEDB_INVAL;
+    if (len > SPIKEDB_META_CAPACITY) return SPIKEDB_INVAL;
+
+    if (b->meta_count == b->meta_cap) {
+        size_t nc = b->meta_cap ? b->meta_cap * 2 : 8;
+        BatchMeta* nm = (BatchMeta*)realloc(b->meta, nc * sizeof(BatchMeta));
+        if (!nm) return SPIKEDB_ERROR;
+        b->meta = nm; b->meta_cap = nc;
+    }
+    char*    kc = (char*)malloc(klen + 1);
+    uint8_t* vc = len ? (uint8_t*)malloc(len) : NULL;
+    if (!kc || (len && !vc)) { free(kc); free(vc); return SPIKEDB_ERROR; }
+    memcpy(kc, key, klen + 1);
+    if (len) memcpy(vc, value, len);
+
+    b->meta[b->meta_count].key   = kc;
+    b->meta[b->meta_count].value = vc;
+    b->meta[b->meta_count].len   = len;
+    b->meta_count++;
+    return SPIKEDB_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * User metadata lives inline in the meta page, so it commits and rolls back
+ * with the transaction that wrote it. Encoding is a flat sequence of
+ * [u16 klen][u16 vlen][key][value].
+ *--------------------------------------------------------------------------*/
+
+static uint32_t meta_kv_locate(const MetaPage* m, const char* key,
+                               uint32_t* out_entry_len) {
+    size_t klen = strlen(key);
+    uint32_t o = 0;
+    while (o + 4 <= m->user_meta_len) {
+        uint16_t kl, vl;
+        memcpy(&kl, m->user_meta + o, 2);
+        memcpy(&vl, m->user_meta + o + 2, 2);
+        uint32_t entry = 4u + kl + vl;
+        if (o + entry > m->user_meta_len) break;
+        if (kl == klen && memcmp(m->user_meta + o + 4, key, klen) == 0) {
+            *out_entry_len = entry;
+            return o;
+        }
+        o += entry;
+    }
+    return UINT32_MAX;
+}
+
+static SpikeDB_Status meta_kv_set(MetaPage* m, const char* key,
+                                  const void* val, size_t vlen) {
+    uint32_t entry_len = 0;
+    uint32_t at = meta_kv_locate(m, key, &entry_len);
+    if (at != UINT32_MAX) {
+        memmove(m->user_meta + at, m->user_meta + at + entry_len,
+                m->user_meta_len - at - entry_len);
+        m->user_meta_len -= entry_len;
+    }
+    if (vlen == 0) return SPIKEDB_OK;              /* erase */
+
+    size_t klen = strlen(key);
+    uint32_t need = (uint32_t)(4 + klen + vlen);
+    if (m->user_meta_len + need > SPIKEDB_META_CAPACITY) return SPIKEDB_FULL;
+
+    uint8_t* p = m->user_meta + m->user_meta_len;
+    uint16_t kl = (uint16_t)klen, vl = (uint16_t)vlen;
+    memcpy(p, &kl, 2);
+    memcpy(p + 2, &vl, 2);
+    memcpy(p + 4, key, klen);
+    memcpy(p + 4 + klen, val, vlen);
+    m->user_meta_len += need;
+    return SPIKEDB_OK;
+}
+
+SpikeDB_Status spike_db_get_meta(SpikeDB* db, const char* key,
+                                 void** value_out, size_t* len_out) {
+    if (!db || !key || !value_out || !len_out) return SPIKEDB_INVAL;
+    *value_out = NULL; *len_out = 0;
+    if (strlen(key) == 0) return SPIKEDB_INVAL;
+
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    const MetaPage* m = &db->meta_buf[db->active_meta];
+    uint32_t entry_len = 0;
+    uint32_t at = meta_kv_locate(m, key, &entry_len);
+    if (at == UINT32_MAX) { file_unlock(db); return SPIKEDB_NOT_FOUND; }
+
+    uint16_t kl, vl;
+    memcpy(&kl, m->user_meta + at, 2);
+    memcpy(&vl, m->user_meta + at + 2, 2);
+    uint8_t* buf = (uint8_t*)malloc((size_t)vl + 1);
+    if (!buf) { file_unlock(db); return SPIKEDB_ERROR; }
+    memcpy(buf, m->user_meta + at + 4 + kl, vl);
+    buf[vl] = 0;
+    *value_out = buf;
+    *len_out   = vl;
+    file_unlock(db);
     return SPIKEDB_OK;
 }
 
@@ -1785,177 +2815,728 @@ static int batch_cmp(const void* a, const void* b) {
     const BatchEntry* x = (const BatchEntry*)a;
     const BatchEntry* y = (const BatchEntry*)b;
     if (x->symbol != y->symbol) return x->symbol < y->symbol ? -1 : 1;
-    if (x->time   != y->time)   return x->time   < y->time   ? -1 : 1;
-    return 0;
+    int k = key_cmp(x->time, x->seq, y->time, y->seq);
+    if (k) return k;
+    return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
 }
 
 SpikeDB_Status spike_db_write(SpikeDB* db, SpikeDB_Batch* b) {
+    return spike_db_write_ex(db, b, 0);
+}
+
+SpikeDB_Status spike_db_sync(SpikeDB* db) {
+    if (!db) return SPIKEDB_INVAL;
+    return io_fsync(db);
+}
+
+SpikeDB_Status spike_db_write_ex(SpikeDB* db, SpikeDB_Batch* b, uint32_t flags) {
     if (!db || !b) return SPIKEDB_INVAL;
     if (db->readonly) return SPIKEDB_ERROR;
-    if (b->count == 0) return SPIKEDB_OK;
+    if (b->count == 0 && b->meta_count == 0) return SPIKEDB_OK;
+
+    bool sync = (flags & SPIKEDB_WRITE_NOSYNC) == 0;
+    SpikeDB_Status fail_st = SPIKEDB_ERROR;
 
     if (file_lock(db, true) != SPIKEDB_OK) return SPIKEDB_ERROR;
     if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
 
     if (txn_begin(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
 
-    /* Sort entries by (symbol, time) to amortize symdir lookups */
-    qsort(b->entries, b->count, sizeof(BatchEntry), batch_cmp);
+    /* Sort by (symbol, time, seq) to amortize symdir lookups; `idx` breaks
+     * ties so entries touching one key apply in submission order. */
+    if (b->count) qsort(b->entries, b->count, sizeof(BatchEntry), batch_cmp);
 
-    /* Because entries are sorted by (symbol, time), we only call
-     * symdir_lookup once per distinct symbol. Use a sentinel != first
-     * symbol to force the very first lookup. */
-    uint64_t cur_sym = b->entries[0].symbol + 1;
+    /* Because entries are grouped by symbol, symdir_lookup happens once
+     * per distinct symbol. Use a sentinel != first symbol to force the
+     * very first lookup. */
+    uint64_t cur_sym = b->count ? b->entries[0].symbol + 1 : 0;
     uint32_t root_pg = SPIKEDB_INVALID_PAGE;
 
     for (size_t i = 0; i < b->count; i++) {
         BatchEntry* e = &b->entries[i];
         if (e->symbol != cur_sym) {
-            if (symdir_lookup(db, e->symbol, &root_pg, true) != SPIKEDB_OK) goto rollback;
+            SpikeDB_Status ls = symdir_lookup(db, e->symbol, &root_pg, false);
+            if (ls == SPIKEDB_NOT_FOUND) root_pg = SPIKEDB_INVALID_PAGE;
+            else if (ls != SPIKEDB_OK) { fail_st = ls; goto rollback; }
             cur_sym = e->symbol;
         }
-        SpikeDB_Status st = symbol_insert(db, root_pg, e->time, b->blob + e->offset, e->length);
-        if (st != SPIKEDB_OK) goto rollback;
+        if (root_pg == SPIKEDB_INVALID_PAGE) {
+            if (e->op == BATCH_OP_DEL) continue;   /* nothing to remove */
+            SpikeDB_Status ls = symdir_lookup(db, e->symbol, &root_pg, true);
+            if (ls != SPIKEDB_OK) { fail_st = ls; goto rollback; }
+        }
+
+        SpikeDB_Status st;
+        if (e->op == BATCH_OP_DEL) {
+            st = symbol_delete(db, root_pg, e->time, e->seq);
+            if (st == SPIKEDB_NOT_FOUND) st = SPIKEDB_OK;   /* idempotent */
+        } else {
+            bool replaced;
+            st = symbol_insert(db, root_pg, e->time, e->seq,
+                               b->blob + e->offset, e->length,
+                               e->op == BATCH_OP_UPSERT, &replaced);
+        }
+        if (st != SPIKEDB_OK) { fail_st = st; goto rollback; }
     }
 
-    SpikeDB_Status cs = txn_commit(db);
-    file_unlock(db);
-    return cs;
+    for (size_t i = 0; i < b->meta_count; i++) {
+        SpikeDB_Status ms = meta_kv_set(&db->meta_buf[db->active_meta],
+                                        b->meta[i].key, b->meta[i].value,
+                                        b->meta[i].len);
+        if (ms != SPIKEDB_OK) { fail_st = ms; goto rollback; }
+    }
+
+    {
+        SpikeDB_Status cs = txn_commit_ex(db, sync);
+        file_unlock(db);
+        SPDB_AUDIT(db);
+        return cs;
+    }
 
 rollback:
     {
         bool oom = db->cache_oom;
         txn_rollback(db);
         file_unlock(db);
-        return oom ? SPIKEDB_FULL : SPIKEDB_ERROR;
+        SPDB_AUDIT(db);
+        return oom ? SPIKEDB_FULL : fail_st;
     }
 }
 
 /*============================================================================
  * Public API: scan iterator
+ *
+ * Records are copied out of the leaves a chunk at a time. In non-blocking
+ * mode the shared lock is dropped between chunks, so a writer waits for
+ * one chunk rather than the whole iteration; the cursor then re-descends
+ * from the last key it emitted whenever the txn id has moved on.
  *============================================================================*/
+
+#define SPDB_ITER_CHUNK_RECS   1024u
+#define SPDB_ITER_CHUNK_BYTES  (256u * 1024u)
+#define SPDB_ITER_REC_HDR      24u      /* u64 symbol, u64 time, u32 seq, u32 len */
+
+/* One per symbol in a merged scan. */
+typedef struct IterSub {
+    uint64_t symbol;
+    uint32_t leaf;                  /* INVALID = finished */
+    uint32_t slot;
+    uint64_t key_time;              /* key of the record at (leaf, slot) */
+    uint32_t key_seq;
+} IterSub;
 
 struct SpikeDB_Iter {
     SpikeDB*  db;
     uint64_t  symbol;
     uint64_t  time_lo;
     uint64_t  time_hi;
-    uint32_t  cur_leaf;             /* INVALID = done */
-    uint32_t  cur_slot;             /* index within cur_leaf */
-    uint8_t*  cur_buf;              /* malloc'd buffer holding last value */
-    size_t    cur_buf_cap;
-    bool      locked;               /* shared lock held? */
+    uint32_t  cur_leaf;             /* INVALID = walk finished (single mode) */
+    uint32_t  cur_slot;
+    uint8_t*  buf;                  /* chunk of packed records */
+    size_t    buf_cap;
+    size_t    buf_len;
+    size_t    buf_pos;
+    bool      locked;               /* shared lock held for the whole lifetime */
+    bool      nonblocking;
+    bool      reverse;
+    bool      multi;
+    bool      exhausted;
+    bool      started;              /* last_* are meaningful */
+    uint64_t  last_time;
+    uint32_t  last_seq;
+    uint64_t  last_symbol;
+    uint64_t  seen_txn;
+
+    IterSub*  subs;                 /* multi mode */
+    uint32_t* heap;                 /* indices into subs, min-heap on key */
+    uint32_t  sub_count;
+    uint32_t  heap_len;
 };
 
-SpikeDB_Iter* spike_db_scan(SpikeDB* db, uint64_t symbol,
-                            uint64_t time_lo, uint64_t time_hi) {
-    if (!db || time_hi < time_lo) return NULL;
-    SpikeDB_Iter* it = (SpikeDB_Iter*)calloc(1, sizeof(SpikeDB_Iter));
-    if (!it) return NULL;
-    it->db = db; it->symbol = symbol; it->time_lo = time_lo; it->time_hi = time_hi;
-    it->cur_leaf = SPIKEDB_INVALID_PAGE;
-
-    /* Hold a shared lock for the iterator's lifetime so the writer
-     * cannot free leaves we're about to walk. */
-    if (file_lock(db, false) != SPIKEDB_OK) { free(it); return NULL; }
-    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); free(it); return NULL; }
-    it->locked = true;
+/* Find the first record of `symbol` with key >= (time, seq) that is still
+ * at or below `time_hi`. Caller holds the shared lock. */
+static void cursor_seek(SpikeDB* db, uint64_t symbol,
+                        uint64_t time, uint32_t seq, uint64_t time_hi,
+                        uint32_t* out_leaf, uint32_t* out_slot,
+                        uint64_t* out_key_time, uint32_t* out_key_seq) {
+    *out_leaf = SPIKEDB_INVALID_PAGE;
+    *out_slot = 0;
 
     uint32_t root_pg;
-    if (symdir_lookup(db, symbol, &root_pg, false) != SPIKEDB_OK) return it;
+    if (symdir_lookup(db, symbol, &root_pg, false) != SPIKEDB_OK) return;
 
     DescentResult d;
-    if (descend(db, root_pg, time_lo, &d) != SPIKEDB_OK) return it;
+    if (descend(db, root_pg, time, seq, &d) != SPIKEDB_OK) return;
     uint32_t lp = d.leaf_page;
     if (lp == SPIKEDB_INVALID_PAGE) {
         uint8_t* rb = page_pin(db, root_pg);
+        if (!rb) return;
         lp = ((SymbolRootPage*)rb)->first_leaf;
         page_unpin(db, root_pg);
     }
-    if (lp == SPIKEDB_INVALID_PAGE) return it;
 
-    /* Find starting slot. May need to advance to next leaf if all times in
-     * this leaf are < time_lo. */
+    /* Every key on a later leaf is greater than the target, so re-running
+     * the same search there lands on slot 0. */
     while (lp != SPIKEDB_INVALID_PAGE) {
         uint8_t* lb = page_pin(db, lp);
-        if (!lb) return it;
+        if (!lb) return;
         LeafHeader* lh = (LeafHeader*)lb;
-        LeafSlot*   ls = leaf_slots(lb);
-        if (lh->record_count > 0 && lh->max_time >= time_lo) {
-            bool exact;
-            uint32_t pos = leaf_search(lh, ls, time_lo, &exact);
-            if (pos < lh->record_count && ls[pos].time <= time_hi) {
-                it->cur_leaf = lp;
-                it->cur_slot = pos;
-                page_unpin(db, lp);
-                return it;
+        bool exact;
+        uint32_t pos = leaf_find(lb, time, seq, &exact);
+        if (pos < lh->record_count) {
+            uint64_t kt; uint32_t ks;
+            leaf_key_at(lb, pos, &kt, &ks);
+            if (kt <= time_hi) {
+                *out_leaf = lp;
+                *out_slot = pos;
+                if (out_key_time) *out_key_time = kt;
+                if (out_key_seq)  *out_key_seq  = ks;
             }
+            page_unpin(db, lp);
+            return;
         }
         uint32_t nx = lh->next_leaf;
         page_unpin(db, lp);
         lp = nx;
     }
+}
+
+static void iter_position(SpikeDB_Iter* it, uint64_t time, uint32_t seq) {
+    cursor_seek(it->db, it->symbol, time, seq, it->time_hi,
+                &it->cur_leaf, &it->cur_slot, NULL, NULL);
+}
+
+/* Greatest key <= (time, seq) that is still at or above time_lo. */
+static void cursor_seek_rev(SpikeDB* db, uint64_t symbol,
+                            uint64_t time, uint32_t seq, uint64_t time_lo,
+                            uint32_t* out_leaf, uint32_t* out_slot) {
+    *out_leaf = SPIKEDB_INVALID_PAGE;
+    *out_slot = 0;
+
+    uint32_t root_pg;
+    if (symdir_lookup(db, symbol, &root_pg, false) != SPIKEDB_OK) return;
+
+    DescentResult d;
+    if (descend(db, root_pg, time, seq, &d) != SPIKEDB_OK) return;
+    uint32_t lp = d.leaf_page;
+
+    /* Every key on an earlier leaf is below the target, so re-running the
+     * same search there lands past its last record. */
+    while (lp != SPIKEDB_INVALID_PAGE) {
+        uint8_t* lb = page_pin(db, lp);
+        if (!lb) return;
+        LeafHeader* lh = (LeafHeader*)lb;
+        bool exact;
+        uint32_t pos = leaf_find(lb, time, seq, &exact);
+        uint32_t hit = exact ? pos : (pos > 0 ? pos - 1 : UINT32_MAX);
+        if (hit != UINT32_MAX && hit < lh->record_count) {
+            uint64_t kt; uint32_t ks;
+            leaf_key_at(lb, hit, &kt, &ks);
+            if (kt >= time_lo) {
+                *out_leaf = lp;
+                *out_slot = hit;
+            }
+            page_unpin(db, lp);
+            return;
+        }
+        uint32_t pv = lh->prev_leaf;
+        page_unpin(db, lp);
+        lp = pv;
+    }
+}
+
+static void iter_position_rev(SpikeDB_Iter* it, uint64_t time, uint32_t seq) {
+    cursor_seek_rev(it->db, it->symbol, time, seq, it->time_lo,
+                    &it->cur_leaf, &it->cur_slot);
+}
+
+/* Append one record to the chunk. Returns false only on allocation failure. */
+static bool chunk_append(SpikeDB_Iter* it, uint64_t symbol,
+                         const uint8_t* leaf, uint32_t idx) {
+    uint64_t t; uint32_t s, vl;
+    leaf_key_at(leaf, idx, &t, &s);
+    const uint8_t* val = leaf_val_at(leaf, idx, &vl);
+
+    size_t need = SPDB_ITER_REC_HDR + vl;
+    if (it->buf_len + need > it->buf_cap) {
+        size_t nc = it->buf_cap ? it->buf_cap * 2 : 65536;
+        while (nc < it->buf_len + need) nc *= 2;
+        uint8_t* nb = (uint8_t*)realloc(it->buf, nc);
+        if (!nb) return false;
+        it->buf = nb;
+        it->buf_cap = nc;
+    }
+    uint8_t* p = it->buf + it->buf_len;
+    memcpy(p,      &symbol, 8);
+    memcpy(p + 8,  &t,      8);
+    memcpy(p + 16, &s,      4);
+    memcpy(p + 20, &vl,     4);
+    memcpy(p + 24, val,     vl);
+    it->buf_len += need;
+    return true;
+}
+
+/* Copy the next chunk of in-range records into it->buf. Caller holds the
+ * shared lock. Returns true if anything was copied. */
+static bool iter_fill_rev(SpikeDB_Iter* it) {
+    SpikeDB* db = it->db;
+    it->buf_len = 0;
+    it->buf_pos = 0;
+    uint32_t count = 0;
+
+    while (it->cur_leaf != SPIKEDB_INVALID_PAGE
+           && count < SPDB_ITER_CHUNK_RECS
+           && it->buf_len < SPDB_ITER_CHUNK_BYTES) {
+        uint8_t* lb = page_pin(db, it->cur_leaf);
+        if (!lb) { it->cur_leaf = SPIKEDB_INVALID_PAGE; break; }
+        LeafHeader* lh = (LeafHeader*)lb;
+        uint32_t    pv = lh->prev_leaf;
+        bool        past_end = false;
+        bool        leaf_done = false;
+
+        if (it->cur_slot >= lh->record_count)
+            it->cur_slot = lh->record_count ? lh->record_count - 1 : 0;
+
+        for (;;) {
+            if (lh->record_count == 0) { leaf_done = true; break; }
+            uint64_t t; uint32_t s;
+            leaf_key_at(lb, it->cur_slot, &t, &s);
+            if (t < it->time_lo) { past_end = true; break; }
+            if (!chunk_append(it, it->symbol, lb, it->cur_slot)) { past_end = true; break; }
+            count++;
+            if (it->cur_slot == 0) { leaf_done = true; break; }
+            it->cur_slot--;
+            if (count >= SPDB_ITER_CHUNK_RECS || it->buf_len >= SPDB_ITER_CHUNK_BYTES)
+                break;
+        }
+        page_unpin(db, it->cur_leaf);
+
+        if (past_end) { it->cur_leaf = SPIKEDB_INVALID_PAGE; break; }
+        if (leaf_done) { it->cur_leaf = pv; it->cur_slot = UINT32_MAX; }
+        else break;                       /* chunk filled mid-leaf */
+    }
+
+    if (it->cur_leaf == SPIKEDB_INVALID_PAGE) it->exhausted = true;
+    return it->buf_len > 0;
+}
+
+static bool iter_fill(SpikeDB_Iter* it) {
+    SpikeDB* db = it->db;
+    it->buf_len = 0;
+    it->buf_pos = 0;
+    uint32_t count = 0;
+
+    while (it->cur_leaf != SPIKEDB_INVALID_PAGE
+           && count < SPDB_ITER_CHUNK_RECS
+           && it->buf_len < SPDB_ITER_CHUNK_BYTES) {
+        uint8_t* lb = page_pin(db, it->cur_leaf);
+        if (!lb) { it->cur_leaf = SPIKEDB_INVALID_PAGE; break; }
+        LeafHeader* lh = (LeafHeader*)lb;
+        uint32_t    rc = lh->record_count;
+        uint32_t    nx = lh->next_leaf;
+        bool        past_end = false;
+
+        while (it->cur_slot < rc) {
+            uint64_t t; uint32_t s;
+            leaf_key_at(lb, it->cur_slot, &t, &s);
+            if (t > it->time_hi) { past_end = true; break; }
+            if (!chunk_append(it, it->symbol, lb, it->cur_slot)) { past_end = true; break; }
+            count++;
+            it->cur_slot++;
+            if (count >= SPDB_ITER_CHUNK_RECS || it->buf_len >= SPDB_ITER_CHUNK_BYTES)
+                break;
+        }
+        page_unpin(db, it->cur_leaf);
+
+        if (past_end) { it->cur_leaf = SPIKEDB_INVALID_PAGE; break; }
+        if (it->cur_slot >= rc) { it->cur_leaf = nx; it->cur_slot = 0; }
+        else break;                       /* chunk filled mid-leaf */
+    }
+
+    if (it->cur_leaf == SPIKEDB_INVALID_PAGE) it->exhausted = true;
+    return it->buf_len > 0;
+}
+
+/*----------------------------------------------------------------------------
+ * Merged multi-symbol scan
+ *--------------------------------------------------------------------------*/
+
+static int sub_cmp(const IterSub* a, const IterSub* b) {
+    int k = key_cmp(a->key_time, a->key_seq, b->key_time, b->key_seq);
+    if (k) return k;
+    return a->symbol < b->symbol ? -1 : (a->symbol > b->symbol ? 1 : 0);
+}
+
+static void sub_settle(SpikeDB_Iter* it, IterSub* s);
+
+static void heap_sift_down(SpikeDB_Iter* it, uint32_t i) {
+    for (;;) {
+        uint32_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < it->heap_len
+            && sub_cmp(&it->subs[it->heap[l]], &it->subs[it->heap[m]]) < 0) m = l;
+        if (r < it->heap_len
+            && sub_cmp(&it->subs[it->heap[r]], &it->subs[it->heap[m]]) < 0) m = r;
+        if (m == i) return;
+        uint32_t t = it->heap[i]; it->heap[i] = it->heap[m]; it->heap[m] = t;
+        i = m;
+    }
+}
+
+static void heap_pop(SpikeDB_Iter* it) {
+    it->heap_len--;
+    if (it->heap_len) {
+        it->heap[0] = it->heap[it->heap_len];
+        heap_sift_down(it, 0);
+    }
+}
+
+/* Re-seek every cursor to the first record at or after (time, seq) and
+ * rebuild the heap. With `skip_ties`, records whose key is exactly
+ * (time, seq) are dropped for symbols at or below `after_symbol` — those
+ * were already emitted, and several symbols sharing one timestamp is the
+ * normal case rather than the exception. Caller holds the shared lock. */
+static void multi_reposition(SpikeDB_Iter* it, uint64_t time, uint32_t seq,
+                             bool skip_ties, uint64_t after_symbol) {
+    it->heap_len = 0;
+    for (uint32_t i = 0; i < it->sub_count; i++) {
+        IterSub* s = &it->subs[i];
+        cursor_seek(it->db, s->symbol, time, seq, it->time_hi,
+                    &s->leaf, &s->slot, &s->key_time, &s->key_seq);
+        if (s->leaf != SPIKEDB_INVALID_PAGE && skip_ties
+            && s->key_time == time && s->key_seq == seq
+            && s->symbol <= after_symbol) {
+            s->slot++;
+            sub_settle(it, s);
+        }
+        if (s->leaf != SPIKEDB_INVALID_PAGE) it->heap[it->heap_len++] = i;
+    }
+    for (int32_t i = (int32_t)it->heap_len / 2 - 1; i >= 0; i--)
+        heap_sift_down(it, (uint32_t)i);
+}
+
+/* Move a cursor to the first in-range record at or after (leaf, slot),
+ * following the leaf chain. Caller holds the shared lock. */
+static void sub_settle(SpikeDB_Iter* it, IterSub* s) {
+    SpikeDB* db = it->db;
+    while (s->leaf != SPIKEDB_INVALID_PAGE) {
+        uint32_t pinned = s->leaf;
+        uint8_t* lb = page_pin(db, pinned);
+        if (!lb) { s->leaf = SPIKEDB_INVALID_PAGE; return; }
+        LeafHeader* lh = (LeafHeader*)lb;
+        if (s->slot < lh->record_count) {
+            uint64_t kt; uint32_t ks;
+            leaf_key_at(lb, s->slot, &kt, &ks);
+            if (kt > it->time_hi) s->leaf = SPIKEDB_INVALID_PAGE;
+            else { s->key_time = kt; s->key_seq = ks; }
+            page_unpin(db, pinned);
+            return;
+        }
+        uint32_t nx = lh->next_leaf;
+        page_unpin(db, pinned);
+        s->leaf = nx;
+        s->slot = 0;
+    }
+}
+
+static bool iter_fill_multi(SpikeDB_Iter* it) {
+    SpikeDB* db = it->db;
+    it->buf_len = 0;
+    it->buf_pos = 0;
+    uint32_t count = 0;
+
+    while (it->heap_len > 0
+           && count < SPDB_ITER_CHUNK_RECS
+           && it->buf_len < SPDB_ITER_CHUNK_BYTES) {
+        IterSub* s = &it->subs[it->heap[0]];
+
+        uint32_t pinned = s->leaf;
+        uint8_t* lb = page_pin(db, pinned);
+        if (!lb) { s->leaf = SPIKEDB_INVALID_PAGE; heap_pop(it); continue; }
+        LeafHeader* lh = (LeafHeader*)lb;
+        uint32_t    rc = lh->record_count;
+        uint32_t    nx = lh->next_leaf;
+
+        if (!chunk_append(it, s->symbol, lb, s->slot)) {
+            page_unpin(db, pinned);
+            break;
+        }
+        count++;
+        s->slot++;
+
+        /* Staying inside the same leaf is the common case and needs no
+         * second pin. */
+        bool settled = false;
+        if (s->slot < rc) {
+            uint64_t kt; uint32_t ks;
+            leaf_key_at(lb, s->slot, &kt, &ks);
+            if (kt > it->time_hi) s->leaf = SPIKEDB_INVALID_PAGE;
+            else { s->key_time = kt; s->key_seq = ks; }
+            settled = true;
+        }
+        page_unpin(db, pinned);
+
+        if (!settled) {
+            s->leaf = nx;
+            s->slot = 0;
+            sub_settle(it, s);
+        }
+
+        if (s->leaf == SPIKEDB_INVALID_PAGE) heap_pop(it);
+        else heap_sift_down(it, 0);
+    }
+
+    if (it->heap_len == 0) it->exhausted = true;
+    return it->buf_len > 0;
+}
+
+static bool iter_fill_any(SpikeDB_Iter* it) {
+    if (it->multi)   return iter_fill_multi(it);
+    if (it->reverse) return iter_fill_rev(it);
+    return iter_fill(it);
+}
+
+/* Step one key past the last one emitted, in the iterator's direction.
+ * Returns false when the key space is exhausted at that end. */
+static bool iter_resume_key(const SpikeDB_Iter* it, uint64_t* t, uint32_t* s) {
+    if (!it->started) {
+        *t = it->reverse ? it->time_hi : it->time_lo;
+        *s = it->reverse ? UINT32_MAX : 0;
+        return true;
+    }
+    *t = it->last_time;
+    *s = it->last_seq;
+    if (it->reverse) {
+        if (*s == 0) {
+            if (*t == 0) return false;
+            (*t)--; *s = UINT32_MAX;
+        } else (*s)--;
+    } else {
+        if (*s == UINT32_MAX) {
+            if (*t == UINT64_MAX) return false;
+            (*t)++; *s = 0;
+        } else (*s)++;
+    }
+    return true;
+}
+
+static bool iter_refill(SpikeDB_Iter* it) {
+    if (it->exhausted) return false;
+    if (!it->nonblocking) return iter_fill_any(it);
+
+    SpikeDB* db = it->db;
+    if (file_lock(db, false) != SPIKEDB_OK) { it->exhausted = true; return false; }
+    if (db_refresh_meta(db) != SPIKEDB_OK) {
+        file_unlock(db); it->exhausted = true; return false;
+    }
+
+    uint64_t txn = db->meta_buf[db->active_meta].txn_id;
+    if (txn != it->seen_txn) {
+        /* Leaves may have split, merged away or moved; re-descend from
+         * just past the last key handed to the caller. */
+        it->seen_txn = txn;
+        if (it->multi) {
+            if (it->started)
+                multi_reposition(it, it->last_time, it->last_seq, true, it->last_symbol);
+            else
+                multi_reposition(it, it->time_lo, 0, false, 0);
+        } else {
+            uint64_t rt; uint32_t rs;
+            if (!iter_resume_key(it, &rt, &rs)) {
+                file_unlock(db); it->exhausted = true; return false;
+            }
+            if (it->reverse) iter_position_rev(it, rt, rs);
+            else             iter_position(it, rt, rs);
+        }
+    }
+
+    bool got = iter_fill_any(it);
+    file_unlock(db);
+    return got;
+}
+
+SpikeDB_Iter* spike_db_scan_ex(SpikeDB* db, uint64_t symbol,
+                               uint64_t time_lo, uint64_t time_hi,
+                               uint32_t flags) {
+    if (!db || time_hi < time_lo) return NULL;
+    SpikeDB_Iter* it = (SpikeDB_Iter*)calloc(1, sizeof(SpikeDB_Iter));
+    if (!it) return NULL;
+    it->db = db; it->symbol = symbol; it->time_lo = time_lo; it->time_hi = time_hi;
+    it->cur_leaf    = SPIKEDB_INVALID_PAGE;
+    it->nonblocking = (flags & SPIKEDB_SCAN_NONBLOCKING) != 0;
+    it->reverse     = (flags & SPIKEDB_SCAN_REVERSE) != 0;
+
+    if (file_lock(db, false) != SPIKEDB_OK) { free(it); return NULL; }
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); free(it); return NULL; }
+
+    it->seen_txn = db->meta_buf[db->active_meta].txn_id;
+    if (it->reverse) iter_position_rev(it, time_hi, UINT32_MAX);
+    else             iter_position(it, time_lo, 0);
+    if (it->cur_leaf == SPIKEDB_INVALID_PAGE) it->exhausted = true;
+
+    if (it->nonblocking) file_unlock(db);
+    else it->locked = true;
     return it;
+}
+
+SpikeDB_Iter* spike_db_scan(SpikeDB* db, uint64_t symbol,
+                            uint64_t time_lo, uint64_t time_hi) {
+    return spike_db_scan_ex(db, symbol, time_lo, time_hi, 0);
+}
+
+SpikeDB_Iter* spike_db_scan_multi(SpikeDB* db,
+                                  const uint64_t* symbols, size_t count,
+                                  uint64_t time_lo, uint64_t time_hi,
+                                  uint32_t flags) {
+    if (!db || time_hi < time_lo) return NULL;
+    if (count && !symbols) return NULL;
+    if (count > UINT32_MAX) return NULL;
+
+    SpikeDB_Iter* it = (SpikeDB_Iter*)calloc(1, sizeof(SpikeDB_Iter));
+    if (!it) return NULL;
+    it->db = db; it->time_lo = time_lo; it->time_hi = time_hi;
+    it->cur_leaf    = SPIKEDB_INVALID_PAGE;
+    it->multi       = true;
+    it->nonblocking = (flags & SPIKEDB_SCAN_NONBLOCKING) != 0;
+    it->sub_count   = (uint32_t)count;
+
+    if (count) {
+        it->subs = (IterSub*)calloc(count, sizeof(IterSub));
+        it->heap = (uint32_t*)calloc(count, sizeof(uint32_t));
+        if (!it->subs || !it->heap) {
+            free(it->subs); free(it->heap); free(it);
+            return NULL;
+        }
+        for (size_t i = 0; i < count; i++) {
+            it->subs[i].symbol = symbols[i];
+            it->subs[i].leaf   = SPIKEDB_INVALID_PAGE;
+        }
+    } else {
+        it->exhausted = true;
+    }
+
+    if (file_lock(db, false) != SPIKEDB_OK) {
+        free(it->subs); free(it->heap); free(it);
+        return NULL;
+    }
+    if (db_refresh_meta(db) != SPIKEDB_OK) {
+        file_unlock(db); free(it->subs); free(it->heap); free(it);
+        return NULL;
+    }
+
+    it->seen_txn = db->meta_buf[db->active_meta].txn_id;
+    if (count) {
+        multi_reposition(it, time_lo, 0, false, 0);
+        if (it->heap_len == 0) it->exhausted = true;
+    }
+
+    if (it->nonblocking) file_unlock(db);
+    else it->locked = true;
+    return it;
+}
+
+/* Decode the record at buf_pos without consuming it. */
+static const uint8_t* iter_peek(SpikeDB_Iter* it, uint64_t* sym, uint64_t* t,
+                                uint32_t* seq, uint32_t* len) {
+    const uint8_t* p = it->buf + it->buf_pos;
+    memcpy(sym, p,      8);
+    memcpy(t,   p + 8,  8);
+    memcpy(seq, p + 16, 4);
+    memcpy(len, p + 20, 4);
+    return p + SPDB_ITER_REC_HDR;
 }
 
 bool spike_db_iter_next(SpikeDB_Iter* it,
                         uint64_t* time_out,
                         const void** value_out, size_t* len_out) {
-    if (!it || it->cur_leaf == SPIKEDB_INVALID_PAGE) return false;
+    return spike_db_iter_next_seq(it, time_out, NULL, value_out, len_out);
+}
 
-    uint8_t* lb = page_pin(it->db, it->cur_leaf);
-    if (!lb) { it->cur_leaf = SPIKEDB_INVALID_PAGE; return false; }
-    LeafHeader* lh = (LeafHeader*)lb;
-    LeafSlot*   ls = leaf_slots(lb);
+bool spike_db_iter_next_seq(SpikeDB_Iter* it,
+                            uint64_t* time_out, uint32_t* seq_out,
+                            const void** value_out, size_t* len_out) {
+    return spike_db_iter_next_multi(it, NULL, time_out, seq_out,
+                                    value_out, len_out);
+}
 
-    while (it->cur_slot >= lh->record_count
-           || ls[it->cur_slot].time > it->time_hi) {
-        if (it->cur_slot < lh->record_count && ls[it->cur_slot].time > it->time_hi) {
-            page_unpin(it->db, it->cur_leaf);
-            it->cur_leaf = SPIKEDB_INVALID_PAGE;
-            return false;
-        }
-        /* Advance to next leaf */
-        uint32_t nx = lh->next_leaf;
-        page_unpin(it->db, it->cur_leaf);
-        it->cur_leaf = nx;
-        it->cur_slot = 0;
-        if (it->cur_leaf == SPIKEDB_INVALID_PAGE) return false;
-        lb = page_pin(it->db, it->cur_leaf);
-        if (!lb) { it->cur_leaf = SPIKEDB_INVALID_PAGE; return false; }
-        lh = (LeafHeader*)lb;
-        ls = leaf_slots(lb);
-        if (lh->record_count == 0) continue;
-        if (lh->min_time > it->time_hi) {
-            page_unpin(it->db, it->cur_leaf);
-            it->cur_leaf = SPIKEDB_INVALID_PAGE;
-            return false;
-        }
-    }
+bool spike_db_iter_next_multi(SpikeDB_Iter* it,
+                              uint64_t* symbol_out, uint64_t* time_out,
+                              uint32_t* seq_out,
+                              const void** value_out, size_t* len_out) {
+    if (!it) return false;
+    if (it->buf_pos >= it->buf_len && !iter_refill(it)) return false;
 
-    /* Emit current slot. Copy value into iter's buffer so it stays valid
-     * across page_unpin. */
-    LeafSlot* s = &ls[it->cur_slot];
-    if (s->value_len > it->cur_buf_cap) {
-        uint8_t* nb = (uint8_t*)realloc(it->cur_buf, s->value_len);
-        if (!nb) { page_unpin(it->db, it->cur_leaf); return false; }
-        it->cur_buf = nb;
-        it->cur_buf_cap = s->value_len;
-    }
-    memcpy(it->cur_buf, lb + s->value_offset, s->value_len);
-    if (time_out)  *time_out  = s->time;
-    if (value_out) *value_out = it->cur_buf;
-    if (len_out)   *len_out   = s->value_len;
-    it->cur_slot++;
-    page_unpin(it->db, it->cur_leaf);
+    uint64_t sym, t; uint32_t sq, vl;
+    const uint8_t* val = iter_peek(it, &sym, &t, &sq, &vl);
+
+    if (symbol_out) *symbol_out = sym;
+    if (time_out)   *time_out   = t;
+    if (seq_out)    *seq_out    = sq;
+    if (value_out)  *value_out  = val;
+    if (len_out)    *len_out    = vl;
+
+    it->buf_pos  += SPDB_ITER_REC_HDR + vl;
+    it->last_time   = t;
+    it->last_seq    = sq;
+    it->last_symbol = sym;
+    it->started     = true;
     return true;
+}
+
+size_t spike_db_iter_next_batch(SpikeDB_Iter* it, SpikeDB_Rec* out, size_t max) {
+    if (!it || !out || max == 0) return 0;
+    if (it->buf_pos >= it->buf_len && !iter_refill(it)) return 0;
+
+    size_t n = 0;
+    while (n < max && it->buf_pos < it->buf_len) {
+        uint64_t sym, t; uint32_t sq, vl;
+        const uint8_t* val = iter_peek(it, &sym, &t, &sq, &vl);
+        out[n].symbol = sym;
+        out[n].time   = t;
+        out[n].seq    = sq;
+        out[n].len    = vl;
+        out[n].value  = val;
+
+        it->buf_pos  += SPDB_ITER_REC_HDR + vl;
+        it->last_time   = t;
+        it->last_seq    = sq;
+        it->last_symbol = sym;
+        n++;
+    }
+    it->started = true;
+    return n;
 }
 
 void spike_db_iter_close(SpikeDB_Iter* it) {
     if (!it) return;
     if (it->locked) file_unlock(it->db);
-    free(it->cur_buf);
+    free(it->subs);
+    free(it->heap);
+    free(it->buf);
     free(it);
+}
+
+SpikeDB_Status spike_db_iter_seek(SpikeDB_Iter* it, uint64_t time, uint32_t seq) {
+    if (!it) return SPIKEDB_INVAL;
+    if (it->multi) return SPIKEDB_INVAL;
+
+    SpikeDB* db = it->db;
+    bool need_lock = it->nonblocking;
+    if (need_lock) {
+        if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+        if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+        it->seen_txn = db->meta_buf[db->active_meta].txn_id;
+    }
+
+    it->buf_len   = 0;
+    it->buf_pos   = 0;
+    it->started   = false;
+    it->exhausted = false;
+    if (it->reverse) iter_position_rev(it, time, seq);
+    else             iter_position(it, time, seq);
+    if (it->cur_leaf == SPIKEDB_INVALID_PAGE) it->exhausted = true;
+
+    if (need_lock) file_unlock(db);
+    return SPIKEDB_OK;
 }
 
 /*============================================================================
@@ -2009,6 +3590,92 @@ SpikeDB_Status spike_db_count(SpikeDB* db, uint64_t symbol, uint64_t* out) {
     return st;
 }
 
+SpikeDB_Status spike_db_symbol_info(SpikeDB* db, uint64_t symbol,
+                                    SpikeDB_SymbolInfo* out) {
+    if (!db || !out) return SPIKEDB_INVAL;
+    memset(out, 0, sizeof(*out));
+
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    uint32_t root_pg;
+    SpikeDB_Status st = symdir_lookup(db, symbol, &root_pg, false);
+    if (st != SPIKEDB_OK) { file_unlock(db); return st; }
+
+    uint8_t* rb = page_pin(db, root_pg);
+    if (!rb) { file_unlock(db); return SPIKEDB_ERROR; }
+    const SymbolRootPage* root = (const SymbolRootPage*)rb;
+    out->record_count = root->record_count;
+    out->leaf_count   = root->leaf_count;
+    out->record_size  = root->record_size;
+    if (root->record_count) {
+        out->min_time = root->min_time;
+        out->max_time = root->max_time;
+    }
+    page_unpin(db, root_pg);
+    file_unlock(db);
+    return SPIKEDB_OK;
+}
+
+SpikeDB_Status spike_db_max_times(SpikeDB* db, const uint64_t* symbols,
+                                  uint64_t* times_out, size_t count) {
+    if (!db || (count && (!symbols || !times_out))) return SPIKEDB_INVAL;
+    if (count == 0) return SPIKEDB_OK;
+
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    for (size_t i = 0; i < count; i++) {
+        times_out[i] = 0;
+        uint32_t root_pg;
+        if (symdir_lookup(db, symbols[i], &root_pg, false) != SPIKEDB_OK) continue;
+        uint8_t* rb = page_pin(db, root_pg);
+        if (!rb) { file_unlock(db); return SPIKEDB_ERROR; }
+        const SymbolRootPage* root = (const SymbolRootPage*)rb;
+        if (root->record_count) times_out[i] = root->max_time;
+        page_unpin(db, root_pg);
+    }
+    file_unlock(db);
+    return SPIKEDB_OK;
+}
+
+SpikeDB_Status spike_db_txn_id(SpikeDB* db, uint64_t* out) {
+    if (!db || !out) return SPIKEDB_INVAL;
+    *out = 0;
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+    *out = db->meta_buf[db->active_meta].txn_id;
+    file_unlock(db);
+    return SPIKEDB_OK;
+}
+
+SpikeDB_Status spike_db_list_symbols(SpikeDB* db, uint64_t* out, size_t cap,
+                                     size_t* count_out) {
+    if (!db || !count_out || (cap && !out)) return SPIKEDB_INVAL;
+    *count_out = 0;
+
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    uint32_t per_pg = SYMDIR_SLOTS_PER_PAGE;
+    size_t   found  = 0;
+    for (uint32_t pg = SPIKEDB_SYMDIR_START;
+         pg < SPIKEDB_SYMDIR_START + SPIKEDB_SYMDIR_PAGES; pg++) {
+        uint8_t* bytes = page_pin(db, pg);
+        if (!bytes) { file_unlock(db); return SPIKEDB_ERROR; }
+        const SymDirSlot* slots = (const SymDirSlot*)bytes;
+        for (uint32_t i = 0; i < per_pg; i++) {
+            if (!symdir_slot_live(&slots[i])) continue;
+            if (found < cap) out[found] = slots[i].symbol;
+            found++;
+        }
+        page_unpin(db, pg);
+    }
+    file_unlock(db);
+    *count_out = found;
+    return SPIKEDB_OK;
+}
+
 /*============================================================================
  * Public API: truncate_before
  *============================================================================*/
@@ -2017,26 +3684,14 @@ SpikeDB_Status spike_db_count(SpikeDB* db, uint64_t symbol, uint64_t* out) {
  * the number of records removed. */
 static uint32_t leaf_drop_below(SpikeDB* db, uint8_t* page, uint64_t cutoff) {
     LeafHeader* h = (LeafHeader*)page;
-    LeafSlot*   ls = leaf_slots(page);
     if (h->record_count == 0 || h->min_time >= cutoff) return 0;
     bool exact;
-    uint32_t cut_idx = leaf_search(h, ls, cutoff, &exact);
-    /* cut_idx = first slot with time >= cutoff (NOT exact since exact would
-     * mean time == cutoff which we keep). */
+    uint32_t cut_idx = leaf_find(page, cutoff, 0, &exact);
     if (cut_idx == 0) return 0;
     uint32_t removed = cut_idx;
-    /* Shift slots down */
-    memmove(&ls[0], &ls[cut_idx], (h->record_count - cut_idx) * sizeof(LeafSlot));
-    h->record_count -= cut_idx;
-    if (h->record_count == 0) {
-        h->min_time = UINT64_MAX;
-        h->max_time = 0;
-        h->value_heap_bottom = SPIKEDB_PAGE_SIZE;
-    } else {
-        h->min_time = ls[0].time;
-        h->max_time = ls[h->record_count - 1].time;
-        (void)leaf_compact(db, page);
-    }
+    leaf_drop_front(page, cut_idx);
+    leaf_refresh_bounds(page);
+    if (h->record_count) (void)leaf_compact(db, page);
     return removed;
 }
 
@@ -2171,6 +3826,7 @@ SpikeDB_Status spike_db_truncate_before(SpikeDB* db, uint64_t symbol,
 
             bool drop = false;
             uint64_t new_first_time = 0;
+            uint32_t new_first_seq  = 0;
             if (target_leaf == SPIKEDB_INVALID_PAGE) drop = true;
             else {
                 uint8_t* tb = page_pin(db, target_leaf);
@@ -2179,7 +3835,9 @@ SpikeDB_Status spike_db_truncate_before(SpikeDB* db, uint64_t symbol,
                     LeafHeader* th = (LeafHeader*)tb;
                     if (th->symbol != symbol || th->record_count == 0
                         || th->max_time < cutoff) drop = true;
-                    else new_first_time = th->min_time;
+                    else {
+                        leaf_key_at(tb, 0, &new_first_time, &new_first_seq);
+                    }
                     page_unpin(db, target_leaf);
                 }
             }
@@ -2200,8 +3858,10 @@ SpikeDB_Status spike_db_truncate_before(SpikeDB* db, uint64_t symbol,
             } else {
                 /* Update first_time if needed */
                 SkipNode* nn2 = node_load(db, cur_ref, &np);
-                if (nn2 && nn2->first_time != new_first_time) {
+                if (nn2 && (nn2->first_time != new_first_time
+                            || nn2->first_seq != new_first_seq)) {
                     nn2->first_time = new_first_time;
+                    nn2->first_seq  = new_first_seq;
                     page_dirty(db, np);
                 }
                 if (nn2) page_unpin(db, np);
@@ -2222,6 +3882,7 @@ SpikeDB_Status spike_db_truncate_before(SpikeDB* db, uint64_t symbol,
 
     SpikeDB_Status cs = txn_commit(db);
     file_unlock(db);
+    SPDB_AUDIT(db);
     return cs;
 
 fail:
@@ -2229,8 +3890,507 @@ fail:
         bool oom = db->cache_oom;
         txn_rollback(db);
         file_unlock(db);
+        SPDB_AUDIT(db);
         return oom ? SPIKEDB_FULL : SPIKEDB_ERROR;
     }
+}
+
+/*============================================================================
+ * Public API: delete_range
+ *============================================================================*/
+
+SpikeDB_Status spike_db_delete_range(SpikeDB* db, uint64_t symbol,
+                                     uint64_t time_lo, uint64_t time_hi) {
+    if (!db || time_hi < time_lo) return SPIKEDB_INVAL;
+    if (db->readonly) return SPIKEDB_ERROR;
+
+    if (file_lock(db, true) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    uint32_t root_pg;
+    SpikeDB_Status st = symdir_lookup(db, symbol, &root_pg, false);
+    if (st == SPIKEDB_NOT_FOUND) { file_unlock(db); return SPIKEDB_OK; }
+    if (st != SPIKEDB_OK) { file_unlock(db); return st; }
+
+    if (txn_begin(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    /* Each pass removes the lowest surviving key in range, so progress is
+     * guaranteed and no key list has to be materialized. */
+    for (;;) {
+        uint64_t t; uint32_t s;
+        SpikeDB_Status f = find_first_ge(db, root_pg, time_lo, 0, &t, &s);
+        if (f == SPIKEDB_NOT_FOUND) break;
+        if (f != SPIKEDB_OK) goto fail;
+        if (t > time_hi) break;
+        if (symbol_delete(db, root_pg, t, s) != SPIKEDB_OK) goto fail;
+    }
+
+    {
+        SpikeDB_Status cs = txn_commit(db);
+        file_unlock(db);
+        SPDB_AUDIT(db);
+        return cs;
+    }
+
+fail:
+    {
+        bool oom = db->cache_oom;
+        txn_rollback(db);
+        file_unlock(db);
+        SPDB_AUDIT(db);
+        return oom ? SPIKEDB_FULL : SPIKEDB_ERROR;
+    }
+}
+
+/*============================================================================
+ * Public API: symbol drop, tailing, prefetch, backup
+ *============================================================================*/
+
+SpikeDB_Status spike_db_symbol_drop(SpikeDB* db, uint64_t symbol) {
+    if (!db) return SPIKEDB_INVAL;
+    if (db->readonly) return SPIKEDB_ERROR;
+
+    if (file_lock(db, true) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    /* Locate the directory slot itself, not just the root page. */
+    uint32_t pg, slot, root_pg = SPIKEDB_INVALID_PAGE;
+    uint32_t hit_pg = SPIKEDB_INVALID_PAGE, hit_slot = 0;
+    symdir_locate(symbol, &pg, &slot);
+    for (uint64_t probes = 0; probes < SYMDIR_TOTAL_SLOTS; probes++) {
+        uint8_t* bytes = page_pin(db, pg);
+        if (!bytes) { file_unlock(db); return SPIKEDB_ERROR; }
+        SymDirSlot* s = (SymDirSlot*)bytes + slot;
+        bool empty = symdir_slot_empty(s);
+        if (!empty && s->symbol == symbol && s->root_page != SYMDIR_TOMBSTONE) {
+            root_pg  = s->root_page;
+            hit_pg   = pg;
+            hit_slot = slot;
+        }
+        page_unpin(db, pg);
+        if (empty || root_pg != SPIKEDB_INVALID_PAGE) break;
+        slot++;
+        if (slot == SYMDIR_SLOTS_PER_PAGE) {
+            slot = 0; pg++;
+            if (pg >= SPIKEDB_SYMDIR_START + SPIKEDB_SYMDIR_PAGES) pg = SPIKEDB_SYMDIR_START;
+        }
+    }
+    if (root_pg == SPIKEDB_INVALID_PAGE) { file_unlock(db); return SPIKEDB_NOT_FOUND; }
+
+    if (txn_begin(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    uint32_t first_leaf, node_pg;
+    {
+        uint8_t* rb = page_pin(db, root_pg);
+        if (!rb) goto fail;
+        SymbolRootPage* root = (SymbolRootPage*)rb;
+        first_leaf = root->first_leaf;
+        node_pg    = root->current_node_page;
+        page_unpin(db, root_pg);
+    }
+
+    for (uint32_t lp = first_leaf; lp != SPIKEDB_INVALID_PAGE; ) {
+        uint8_t* lb = page_pin(db, lp);
+        if (!lb) goto fail;
+        uint32_t nx = ((LeafHeader*)lb)->next_leaf;
+        page_unpin(db, lp);
+        if (page_free(db, lp) != SPIKEDB_OK) goto fail;
+        lp = nx;
+    }
+    for (uint32_t np = node_pg; np != SPIKEDB_INVALID_PAGE; ) {
+        uint8_t* nb = page_pin(db, np);
+        if (!nb) goto fail;
+        uint32_t nx = ((NodePageHeader*)nb)->next_node_page;
+        page_unpin(db, np);
+        if (page_free(db, np) != SPIKEDB_OK) goto fail;
+        np = nx;
+    }
+    if (page_free(db, root_pg) != SPIKEDB_OK) goto fail;
+
+    {
+        uint8_t* bytes = page_pin(db, hit_pg);
+        if (!bytes) goto fail;
+        SymDirSlot* s = (SymDirSlot*)bytes + hit_slot;
+        s->symbol    = symbol;
+        s->root_page = SYMDIR_TOMBSTONE;
+        page_dirty(db, hit_pg);
+        page_unpin(db, hit_pg);
+    }
+    {
+        MetaPage* m = &db->meta_buf[db->active_meta];
+        if (m->symbol_count) m->symbol_count--;
+    }
+
+    {
+        SpikeDB_Status cs = txn_commit(db);
+        file_unlock(db);
+        SPDB_AUDIT(db);
+        return cs;
+    }
+
+fail:
+    {
+        bool oom = db->cache_oom;
+        txn_rollback(db);
+        file_unlock(db);
+        SPDB_AUDIT(db);
+        return oom ? SPIKEDB_FULL : SPIKEDB_ERROR;
+    }
+}
+
+static void spdb_sleep_us(uint32_t us) {
+#ifdef _WIN32
+    Sleep(us < 1000 ? 1 : us / 1000);
+#else
+    struct timespec ts;
+    ts.tv_sec  = us / 1000000u;
+    ts.tv_nsec = (long)(us % 1000000u) * 1000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
+SpikeDB_Status spike_db_wait_for_txn(SpikeDB* db, uint64_t last_seen,
+                                     uint32_t timeout_ms, uint64_t* out) {
+    if (!db || !out) return SPIKEDB_INVAL;
+    *out = 0;
+
+    uint32_t waited_us = 0;
+    uint32_t backoff_us = 100;
+    for (;;) {
+        uint64_t txn;
+        SpikeDB_Status st = spike_db_txn_id(db, &txn);
+        if (st != SPIKEDB_OK) return st;
+        if (txn != last_seen) { *out = txn; return SPIKEDB_OK; }
+        if (waited_us >= (uint64_t)timeout_ms * 1000u) { *out = txn; return SPIKEDB_NOT_FOUND; }
+        spdb_sleep_us(backoff_us);
+        waited_us += backoff_us;
+        if (backoff_us < 5000) backoff_us *= 2;
+    }
+}
+
+SpikeDB_Status spike_db_prefetch(SpikeDB* db, uint64_t symbol,
+                                 uint64_t time_lo, uint64_t time_hi) {
+    if (!db || time_hi < time_lo) return SPIKEDB_INVAL;
+
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    uint32_t leaf, slot;
+    cursor_seek(db, symbol, time_lo, 0, time_hi, &leaf, &slot, NULL, NULL);
+
+    /* Touching more than the cache holds would just evict what we warmed. */
+    uint32_t budget = db->cache_capacity > 8 ? db->cache_capacity - 8 : 1;
+    while (leaf != SPIKEDB_INVALID_PAGE && budget--) {
+        uint8_t* lb = page_pin(db, leaf);
+        if (!lb) break;
+        LeafHeader* lh = (LeafHeader*)lb;
+        uint32_t nx = lh->next_leaf;
+        bool done = (lh->record_count == 0) || (lh->min_time > time_hi);
+        page_unpin(db, leaf);
+        if (done) break;
+        leaf = nx;
+    }
+
+    file_unlock(db);
+    return SPIKEDB_OK;
+}
+
+SpikeDB_Status spike_db_backup(SpikeDB* db, const char* dest_path) {
+    if (!db || !dest_path) return SPIKEDB_INVAL;
+
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_ERROR; }
+
+    uint64_t pages = db->meta_buf[db->active_meta].total_pages_allocated;
+    uint8_t* buf = (uint8_t*)malloc(SPIKEDB_PAGE_SIZE);
+    FILE*    f   = fopen(dest_path, "wb");
+    if (!buf || !f) {
+        free(buf);
+        if (f) fclose(f);
+        file_unlock(db);
+        return set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
+                       "backup destination could not be opened");
+    }
+
+    SpikeDB_Status st = SPIKEDB_OK;
+    for (uint64_t p = 0; p < pages; p++) {
+        if (io_read(db, (uint32_t)p, buf) != SPIKEDB_OK) { st = SPIKEDB_ERROR; break; }
+        if (fwrite(buf, 1, SPIKEDB_PAGE_SIZE, f) != SPIKEDB_PAGE_SIZE) {
+            st = set_err(db, SPIKEDB_ERROR, os_last_error(), (uint32_t)p,
+                         "backup write failed");
+            break;
+        }
+    }
+
+    if (st == SPIKEDB_OK && fflush(f) != 0) st = SPIKEDB_ERROR;
+    fclose(f);
+    free(buf);
+    file_unlock(db);
+    return st;
+}
+
+/*============================================================================
+ * Public API: diagnostics
+ *============================================================================*/
+const char* spike_db_strerror(SpikeDB_Status status) {
+    switch (status) {
+        case SPIKEDB_OK:        return "ok";
+        case SPIKEDB_NOT_FOUND: return "not found";
+        case SPIKEDB_ERROR:     return "i/o or system error";
+        case SPIKEDB_FULL:      return "capacity exhausted";
+        case SPIKEDB_CORRUPT:   return "corrupt or unrecognized file";
+        case SPIKEDB_INVAL:     return "invalid argument";
+    }
+    return "unknown status";
+}
+
+void spike_db_last_error(SpikeDB* db, SpikeDB_Error* out) {
+    if (!out) return;
+    if (!db) {
+        memset(out, 0, sizeof(*out));
+        out->page = SPIKEDB_INVALID_PAGE;
+        snprintf(out->message, sizeof(out->message), "no database handle");
+        return;
+    }
+    *out = db->last_error;
+    if (out->message[0] == 0)
+        snprintf(out->message, sizeof(out->message), "%s", spike_db_strerror(out->status));
+}
+
+/*============================================================================
+ * Public API: verify
+ *============================================================================*/
+
+static void vfy_err(SpikeDB_VerifyReport* r, const char* fmt, ...) {
+    r->errors++;
+    if (r->first_error[0]) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(r->first_error, sizeof(r->first_error), fmt, ap);
+    va_end(ap);
+}
+
+static void verify_symbol(SpikeDB* db, uint64_t symbol, uint32_t root_pg,
+                          SpikeDB_VerifyReport* r) {
+    uint8_t* rb = page_pin(db, root_pg);
+    if (!rb) { vfy_err(r, "symbol %llu: root page %u unreadable",
+                       (unsigned long long)symbol, root_pg); return; }
+    SymbolRootPage root = *(SymbolRootPage*)rb;    /* copy: leaves get pinned below */
+    page_unpin(db, root_pg);
+
+    if (root.symbol != symbol)
+        vfy_err(r, "symbol %llu: root page holds %llu",
+                (unsigned long long)symbol, (unsigned long long)root.symbol);
+
+    uint64_t leaves = 0, records = 0;
+    uint64_t seen_min = UINT64_MAX, seen_max = 0;
+    uint32_t prev_leaf = SPIKEDB_INVALID_PAGE, last_leaf = SPIKEDB_INVALID_PAGE;
+    uint64_t prev_time = 0; uint32_t prev_seq = 0; bool have_prev = false;
+
+    /* A corrupt next_leaf could form a cycle, so bound the walk. */
+    uint64_t limit = root.leaf_count + 8;
+    uint32_t lp = root.first_leaf;
+
+    while (lp != SPIKEDB_INVALID_PAGE) {
+        if (leaves >= limit) {
+            vfy_err(r, "symbol %llu: leaf chain exceeds leaf_count %llu (cycle?)",
+                    (unsigned long long)symbol, (unsigned long long)root.leaf_count);
+            return;
+        }
+        uint8_t* lb = page_pin(db, lp);
+        if (!lb) { vfy_err(r, "symbol %llu: leaf page %u unreadable",
+                           (unsigned long long)symbol, lp); return; }
+        LeafHeader* h  = (LeafHeader*)lb;
+
+        if (h->symbol != symbol)
+            vfy_err(r, "leaf %u: symbol %llu, expected %llu",
+                    lp, (unsigned long long)h->symbol, (unsigned long long)symbol);
+        if (h->record_size != root.record_size)
+            vfy_err(r, "leaf %u: record_size %u, root says %u",
+                    lp, h->record_size, root.record_size);
+        if (h->prev_leaf != prev_leaf)
+            vfy_err(r, "leaf %u: prev_leaf %u, expected %u",
+                    lp, h->prev_leaf, prev_leaf);
+        if (h->record_count == 0)
+            vfy_err(r, "leaf %u: empty leaf left in the chain", lp);
+
+        uint32_t slots_end = LEAF_HDR_SIZE + h->record_count * (uint32_t)LEAF_SLOT_SIZE;
+        if (!h->record_size
+            && (h->value_heap_bottom > SPDB_PAGE_BODY || slots_end > h->value_heap_bottom))
+            vfy_err(r, "leaf %u: slot dir ends at %u, heap bottom %u",
+                    lp, slots_end, h->value_heap_bottom);
+        if (h->record_size && h->record_count > LEAF_FIXED_CAP(h->record_size))
+            vfy_err(r, "leaf %u: %u records exceeds fixed capacity %u",
+                    lp, h->record_count, LEAF_FIXED_CAP(h->record_size));
+
+        for (uint32_t i = 0; i < h->record_count; i++) {
+            uint64_t kt; uint32_t ks;
+            leaf_key_at(lb, i, &kt, &ks);
+            if (have_prev && key_cmp(kt, ks, prev_time, prev_seq) <= 0) {
+                vfy_err(r, "leaf %u slot %u: key %llu/%u not above %llu/%u",
+                        lp, i, (unsigned long long)kt, ks,
+                        (unsigned long long)prev_time, prev_seq);
+            }
+            prev_time = kt; prev_seq = ks; have_prev = true;
+
+            if (!h->record_size) {
+                const LeafSlot* ls = (const LeafSlot*)(lb + LEAF_HDR_SIZE);
+                if (ls[i].value_offset < h->value_heap_bottom
+                    || (uint32_t)ls[i].value_offset + ls[i].value_len > SPDB_PAGE_BODY)
+                    vfy_err(r, "leaf %u slot %u: value [%u,+%u) outside the heap",
+                            lp, i, ls[i].value_offset, ls[i].value_len);
+            }
+        }
+
+        if (h->record_count) {
+            uint64_t ft, lt; uint32_t fs, lsq;
+            leaf_key_at(lb, 0, &ft, &fs);
+            leaf_key_at(lb, h->record_count - 1, &lt, &lsq);
+            if (h->min_time != ft || h->max_time != lt)
+                vfy_err(r, "leaf %u: header range %llu..%llu, records %llu..%llu",
+                        lp, (unsigned long long)h->min_time,
+                        (unsigned long long)h->max_time,
+                        (unsigned long long)ft, (unsigned long long)lt);
+            if (ft < seen_min) seen_min = ft;
+            if (lt > seen_max) seen_max = lt;
+        }
+
+        records += h->record_count;
+        leaves++;
+        prev_leaf = lp;
+        last_leaf = lp;
+        uint32_t nx = h->next_leaf;
+        page_unpin(db, lp);
+        lp = nx;
+    }
+
+    if (leaves != root.leaf_count)
+        vfy_err(r, "symbol %llu: walked %llu leaves, root says %llu",
+                (unsigned long long)symbol, (unsigned long long)leaves,
+                (unsigned long long)root.leaf_count);
+    if (records != root.record_count)
+        vfy_err(r, "symbol %llu: counted %llu records, root says %llu",
+                (unsigned long long)symbol, (unsigned long long)records,
+                (unsigned long long)root.record_count);
+    if (last_leaf != root.last_leaf)
+        vfy_err(r, "symbol %llu: chain ends at %u, root says %u",
+                (unsigned long long)symbol, last_leaf, root.last_leaf);
+    if (records) {
+        if (root.min_time != seen_min || root.max_time != seen_max)
+            vfy_err(r, "symbol %llu: root range %llu..%llu, leaves %llu..%llu",
+                    (unsigned long long)symbol,
+                    (unsigned long long)root.min_time,
+                    (unsigned long long)root.max_time,
+                    (unsigned long long)seen_min, (unsigned long long)seen_max);
+    }
+
+    /* Every skip-list level must be ascending, and each node's key must
+     * still match the first key of the leaf it points at. */
+    for (int lvl = 0; lvl < SPIKEDB_MAX_LEVEL; lvl++) {
+        uint64_t ref = root.head_forward[lvl];
+        uint64_t steps = 0;
+        uint64_t nt = 0; uint32_t ns = 0; bool have = false;
+        while (ref != NODE_REF_NIL) {
+            if (steps++ > limit) {
+                vfy_err(r, "symbol %llu level %d: node chain exceeds %llu (cycle?)",
+                        (unsigned long long)symbol, lvl, (unsigned long long)limit);
+                break;
+            }
+            uint32_t np;
+            SkipNode* n = node_load(db, ref, &np);
+            if (!n) { vfy_err(r, "symbol %llu level %d: node page unreadable",
+                              (unsigned long long)symbol, lvl); break; }
+            uint64_t ft = n->first_time; uint32_t fs = n->first_seq;
+            uint32_t lpg = n->leaf_page;
+            uint64_t next = n->forward[lvl];
+            page_unpin(db, np);
+
+            if (have && key_cmp(ft, fs, nt, ns) <= 0)
+                vfy_err(r, "symbol %llu level %d: node key %llu/%u not above %llu/%u",
+                        (unsigned long long)symbol, lvl,
+                        (unsigned long long)ft, fs, (unsigned long long)nt, ns);
+            nt = ft; ns = fs; have = true;
+
+            if (lpg != SPIKEDB_INVALID_PAGE) {
+                uint8_t* lb = page_pin(db, lpg);
+                if (!lb) vfy_err(r, "symbol %llu level %d: leaf %u unreadable",
+                                 (unsigned long long)symbol, lvl, lpg);
+                else {
+                    LeafHeader* h = (LeafHeader*)lb;
+                    uint64_t kt = 0; uint32_t ks = 0;
+                    if (h->record_count) leaf_key_at(lb, 0, &kt, &ks);
+                    if (h->symbol != symbol || h->record_count == 0
+                        || kt != ft || ks != fs)
+                        vfy_err(r, "symbol %llu level %d: node key %llu/%u does not "
+                                   "match leaf %u", (unsigned long long)symbol, lvl,
+                                (unsigned long long)ft, fs, lpg);
+                    page_unpin(db, lpg);
+                }
+            }
+            ref = next;
+        }
+    }
+
+    r->leaves  += leaves;
+    r->records += records;
+    r->symbols += 1;
+}
+
+SpikeDB_Status spike_db_verify(SpikeDB* db, SpikeDB_VerifyReport* out) {
+    if (!db || !out) return SPIKEDB_INVAL;
+    memset(out, 0, sizeof(*out));
+
+    if (file_lock(db, false) != SPIKEDB_OK) return SPIKEDB_ERROR;
+    if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); return SPIKEDB_CORRUPT; }
+
+    const MetaPage* m = &db->meta_buf[db->active_meta];
+    uint64_t total_pages = m->total_pages_allocated;
+
+    for (uint32_t pg = SPIKEDB_SYMDIR_START;
+         pg < SPIKEDB_SYMDIR_START + SPIKEDB_SYMDIR_PAGES; pg++) {
+        uint8_t* bytes = page_pin(db, pg);
+        if (!bytes) { vfy_err(out, "symbol directory page %u unreadable", pg); continue; }
+        SymDirSlot slots[1];
+        for (uint32_t i = 0; i < SYMDIR_SLOTS_PER_PAGE; i++) {
+            slots[0] = ((const SymDirSlot*)bytes)[i];
+            if (!symdir_slot_live(&slots[0])) continue;
+            if (slots[0].root_page < SPIKEDB_RESERVED_PAGES
+                || slots[0].root_page >= total_pages) {
+                vfy_err(out, "symbol %llu: root page %u out of range",
+                        (unsigned long long)slots[0].symbol, slots[0].root_page);
+                continue;
+            }
+            page_unpin(db, pg);
+            verify_symbol(db, slots[0].symbol, slots[0].root_page, out);
+            bytes = page_pin(db, pg);
+            if (!bytes) { vfy_err(out, "symbol directory page %u unreadable", pg); break; }
+        }
+        if (bytes) page_unpin(db, pg);
+    }
+
+    /* A corrupt free list would hand the same page out twice, so walk it. */
+    uint32_t fl = m->freelist_head;
+    uint64_t fl_pages = 0;
+    while (fl != SPIKEDB_INVALID_PAGE) {
+        if (fl_pages++ > total_pages) {
+            vfy_err(out, "free list longer than the file (cycle?)");
+            break;
+        }
+        uint8_t* fb = page_pin(db, fl);
+        if (!fb) { vfy_err(out, "free list page %u unreadable", fl); break; }
+        FreelistPage* fp = (FreelistPage*)fb;
+        if (fp->count > FREELIST_CAPACITY)
+            vfy_err(out, "free list page %u: count %u exceeds capacity", fl, fp->count);
+        else
+            out->free_pages += fp->count;
+        uint32_t nx = fp->next_page;
+        page_unpin(db, fl);
+        fl = nx;
+    }
+    out->free_pages += fl_pages;   /* the list pages are themselves free space */
+
+    file_unlock(db);
+    return out->errors ? SPIKEDB_CORRUPT : SPIKEDB_OK;
 }
 
 void spike_db_stats(SpikeDB* db, SpikeDB_Stats* out) {
@@ -2246,4 +4406,96 @@ void spike_db_stats(SpikeDB* db, SpikeDB_Stats* out) {
     out->symbol_count   = m->symbol_count;
     for (uint32_t i = 0; i < db->cache_capacity; i++)
         if (db->slots[i].valid) out->cache_used++;
+
+    /* Best effort: a bad chain reports what it managed to walk rather than
+     * failing a diagnostic call. */
+    for (uint32_t fl = m->freelist_head; fl != SPIKEDB_INVALID_PAGE; ) {
+        if (out->free_pages > out->total_pages) break;
+        uint8_t* fb = page_pin(db, fl);
+        if (!fb) break;
+        FreelistPage* fp = (FreelistPage*)fb;
+        uint32_t nx = fp->next_page;
+        if (fp->count <= FREELIST_CAPACITY) out->free_pages += fp->count;
+        out->free_pages++;              /* the list page is free space too */
+        page_unpin(db, fl);
+        fl = nx;
+    }
+}
+
+/*============================================================================
+ * Internal structural audit (spike_db_internal.h)
+ *
+ * spike_db_verify walks the file; this walks what never reaches it. A leaked
+ * pin or a stale hash entry is invisible on disk and surfaces much later as
+ * an unrelated SPIKEDB_FULL, so it is worth checking at the moment it
+ * happens rather than at the moment it hurts.
+ *============================================================================*/
+
+int spike_db_internal_check(SpikeDB* db, char* msg, size_t msg_len) {
+    if (msg && msg_len) msg[0] = 0;
+    if (!db) {
+        if (msg && msg_len) snprintf(msg, msg_len, "null handle");
+        return 1;
+    }
+
+    int  problems = 0;
+    char first[192];
+    first[0] = 0;
+
+#define AUDIT_ERR(...) do {                                          \
+        if (problems == 0) snprintf(first, sizeof(first), __VA_ARGS__); \
+        problems++;                                                  \
+    } while (0)
+
+    if (db->in_txn) AUDIT_ERR("transaction still in flight");
+    if (db->io == NULL) AUDIT_ERR("no I/O table installed");
+
+    uint32_t valid = 0;
+    for (uint32_t i = 0; i < db->cache_capacity; i++) {
+        const CacheSlot* s = &db->slots[i];
+        if (!s->valid) {
+            if (s->page_id != SPIKEDB_INVALID_PAGE)
+                AUDIT_ERR("slot %u: free but still holds page %u", i, s->page_id);
+            if (s->pin_count != 0)
+                AUDIT_ERR("slot %u: free but pinned %u times", i, s->pin_count);
+            continue;
+        }
+        valid++;
+        if (s->page_id == SPIKEDB_INVALID_PAGE)
+            AUDIT_ERR("slot %u: valid with no page id", i);
+        if (s->pin_count != 0)
+            AUDIT_ERR("slot %u: page %u still pinned %u times",
+                      i, s->page_id, s->pin_count);
+        if (s->dirty)
+            AUDIT_ERR("slot %u: page %u dirty outside a transaction", i, s->page_id);
+        if (s->fresh)
+            AUDIT_ERR("slot %u: page %u marked fresh outside a transaction",
+                      i, s->page_id);
+
+        uint32_t h = ht_probe(db, s->page_id);
+        if (db->ht[h] == HT_EMPTY)
+            AUDIT_ERR("slot %u: page %u missing from the hash table", i, s->page_id);
+        else if (db->ht[h] != i)
+            AUDIT_ERR("page %u maps to slot %u, not %u", s->page_id, db->ht[h], i);
+    }
+
+    uint32_t entries = 0;
+    for (uint32_t i = 0; i <= db->ht_mask; i++) {
+        if (db->ht[i] == HT_EMPTY) continue;
+        entries++;
+        uint32_t s = db->ht[i];
+        if (s >= db->cache_capacity) {
+            AUDIT_ERR("hash entry %u: slot %u out of range", i, s);
+            continue;
+        }
+        if (!db->slots[s].valid)
+            AUDIT_ERR("hash entry %u points at free slot %u", i, s);
+    }
+    if (entries != valid)
+        AUDIT_ERR("hash table holds %u entries for %u cached pages", entries, valid);
+
+#undef AUDIT_ERR
+
+    if (msg && msg_len && problems) snprintf(msg, msg_len, "%s", first);
+    return problems;
 }
