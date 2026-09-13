@@ -71,7 +71,7 @@ for phase-specific presets, application-owned dependencies and native requiremen
 
 ## AI tools
 
-The project-local MCP server is configured in `.vscode/mcp.json` and runs directly
-with PowerShell 7.4+, without external packages or a build step. Its default
-configuration does not execute project builds/tests; add `-AllowExecution` only for
-a trusted project. See [AGENTS.md](AGENTS.md).
+The project-local MCP server is configured in `.vscode/mcp.json`, which invokes
+`./dd.ps1 mcp`, and runs directly with PowerShell 7.4+ without external packages or a
+build step. Its default configuration does not execute project builds/tests; add
+`--allow-execution` only for a trusted project. See [AGENTS.md](AGENTS.md).
