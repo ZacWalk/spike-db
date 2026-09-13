@@ -16,7 +16,7 @@ function Invoke-Driver([string[]]$Arguments, [int]$ExpectedExit = 0) {
 
 $upstream = Get-Content (Join-Path $root 'docs/dd-upstream.json') -Raw | ConvertFrom-Json -AsHashtable
 if ($upstream.repository -ne 'https://github.com/ZacWalk/dd' -or
-    $upstream.revision -ne 'b64dc38fca7d7a1e9397a70d0ed80d04dc61e1d1' -or
+    $upstream.revision -ne '0a356d82a256b021e9209b26aa198a247ff4f419' -or
     $upstream.version -ne '0.2.0') {
     throw 'Expected the reviewed dd v0.2.0 release.'
 }

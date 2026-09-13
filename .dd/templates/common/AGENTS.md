@@ -5,11 +5,28 @@ The manifest is a data-only hashtable loaded with Import-PowerShellDataFile, nev
 dot-sourced or evaluated. Preserve its schema and use arrays for targets.
 Do not customize .dd/ for application behavior.
 
+## dd has two modes
+
+**CLI mode** is the default and the single behavior owner. Each verb runs once, prints
+one schema 1 result envelope, and exits:
+
 ```powershell
 pwsh -NoProfile -File ./dd.ps1 doctor --json
 pwsh -NoProfile -File ./dd.ps1 dep install --json
 pwsh -NoProfile -File ./dd.ps1 test --json
 ```
+
+**MCP mode** starts with `dd mcp`. The process becomes a stdio JSON-RPC server and stays
+alive until stdin closes, adapting typed MCP requests onto CLI mode — each tool call runs
+as a child `dd` invocation and returns that command's envelope:
+
+```powershell
+pwsh -NoProfile -File ./dd.ps1 mcp
+```
+
+MCP mode owns stdout for protocol messages, so it prints no result envelope, rejects
+`--json`, and sends diagnostics to stderr. Its workspace boundary is the project root.
+Use CLI mode for ordinary work; MCP mode is only for an MCP client.
 
 - Native builds use MSVC on Windows and GCC on Linux. GUI support is Windows-only.
 - Use --non-interactive and --json for automation. Result schema 1 includes ok,
@@ -34,6 +51,7 @@ pwsh -NoProfile -File ./dd.ps1 test --json
   Preview/apply missing F5 entries via `dd targets --vscode --dry-run` / `--yes`.
   Targets of kind `library` build, test and answer --app, but never run or launch and
   get no debugger entry; keep project.default-target on an executable target.
-- Optional project-local MCP is configured in .vscode/mcp.json and uses PowerShell
-  7.4+ with no external packages. Accept the client's trust prompt to start it. Add -AllowExecution to its args
-  only after the user authorizes project-code execution, including custom dry-runs.
+- Project-local MCP mode is configured in .vscode/mcp.json, which invokes `./dd.ps1 mcp`
+  and uses PowerShell 7.4+ with no external packages. Accept the client's trust prompt to
+  start it. Add --allow-execution to its args only after the user authorizes project-code
+  execution, including custom dry-runs. Register it with `dd ide --mcp` when absent.
