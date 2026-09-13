@@ -27,7 +27,7 @@ function Read-DDOptions([string[]]$Arguments) {
     $positionals = [Collections.Generic.List[string]]::new()
     $forwarded = [Collections.Generic.List[string]]::new()
     $valueOptions = @('type', 'name', 'project', 'ref', 'git', 'url', 'sha256', 'method', 'jobs', 'target', 'timeout', 'version', 'app', 'label')
-    $flagOptions = @('json', 'dry-run', 'non-interactive', 'yes', 'available', 'verbose', 'no-summary', 'register', 'vscode')
+    $flagOptions = @('json', 'dry-run', 'non-interactive', 'yes', 'available', 'verbose', 'no-summary', 'mcp', 'allow-execution', 'vscode')
     for ($index = 0; $index -lt $Arguments.Count; $index++) {
         $argument = $Arguments[$index]
         if ($argument -eq '--') {
@@ -268,7 +268,7 @@ function Assert-DDProjectCommands([string]$Root, $Commands) {
         if ($definition.ContainsKey('parameters') -and $definition.parameters -isnot [hashtable]) { Stop-DD "Command $name parameters must be a hashtable." }
         foreach ($parameter in @($definition.parameters.Keys)) {
             if ($null -eq $parameter) { continue }
-            if ($parameter -cnotmatch '^[a-z][a-z0-9-]*$' -or $parameter -in @('project', 'json', 'non-interactive', 'dry-run', 'yes', 'available', 'verbose', 'no-summary', 'register', 'vscode', 'words', 'forwarded')) { Stop-DD "Invalid or reserved parameter: $parameter" }
+            if ($parameter -cnotmatch '^[a-z][a-z0-9-]*$' -or $parameter -in @('project', 'json', 'non-interactive', 'dry-run', 'yes', 'available', 'verbose', 'no-summary', 'mcp', 'allow-execution', 'vscode', 'words', 'forwarded')) { Stop-DD "Invalid or reserved parameter: $parameter" }
             $spec = $definition.parameters[$parameter]
             Assert-DDFields $spec @('type', 'description', 'choices', 'default', 'required') "parameter $parameter"
             Assert-DDPresent $spec @('type') "parameter $parameter" "parameter $parameter"
@@ -558,7 +558,7 @@ function Invoke-DDCommand($Options) {
                 if ($entry.Count -ne 1) { Stop-DD "No project command named $name. Use dd help for built-ins or dd commands." }
                 return $entry[0]
             }
-            return @{ version = $script:DDVersion; commands = @('init --type gui|cli|library [--name NAME]', 'toolchain [--yes]', 'doctor', 'dep list|install|update', 'build [debug|release|both] [--app ID,ID]', 'test [--app ID,ID] [--label REGEX] [--name REGEX]', 'run [TARGET] [--timeout SECONDS] -- ARGS', 'launch [TARGET] -- ARGS', 'targets', 'commands', 'help NAME', 'clean [debug|release|both] [--yes]', 'ide [--yes]', 'fmt [--dry-run]', 'env', 'self-update [--version vX.Y.Z] [--yes]', 'adopt --dry-run', 'mcp [--register]'); options = @('--json', '--project PATH', '--non-interactive'); repository = 'https://github.com/ZacWalk/dd' }
+            return @{ version = $script:DDVersion; commands = @('init --type gui|cli|library [--name NAME]', 'toolchain [--yes]', 'doctor', 'dep list|install|update', 'build [debug|release|both] [--app ID,ID]', 'test [--app ID,ID] [--label REGEX] [--name REGEX]', 'run [TARGET] [--timeout SECONDS] -- ARGS', 'launch [TARGET] -- ARGS', 'targets', 'commands', 'help NAME', 'clean [debug|release|both] [--yes]', 'ide [--yes] [--mcp]', 'fmt [--dry-run]', 'env', 'self-update [--version vX.Y.Z] [--yes]', 'adopt --dry-run', 'mcp [--allow-execution]'); options = @('--json', '--project PATH', '--non-interactive'); repository = 'https://github.com/ZacWalk/dd' }
         }
         'commands' {
             Assert-DDOptions $Options @()

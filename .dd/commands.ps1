@@ -127,7 +127,23 @@ function Invoke-DDExtendedCommand([string]$Command, [string]$Root, $Options) {
         'toolchain' { return Invoke-DDToolchain $Root $Options }
         'clean' { return Invoke-DDClean $Root $Options }
         'ide' {
-            Assert-DDOptions $Options @('yes')
+            Assert-DDOptions $Options @('yes', 'mcp', 'dry-run')
+            # MCP registration is editor integration, not solution generation, so it runs
+            # before the Windows-only Visual Studio path.
+            if ($Options.mcp) {
+                $server = Join-Path $script:DDHome 'mcp/server.ps1'
+                if (-not (Test-Path $server)) { Stop-DD 'PowerShell MCP runtime is incomplete. Restore the source checkout or reinstall dd.' 3 }
+                $Root = Find-DDProject $Root
+                $driver = Get-DDPath $Root 'dd.ps1'
+                if (-not (Test-Path $driver)) { Stop-DD 'No dd.ps1 driver at the project root. Run dd init or adopt dd first.' }
+                $configuration = @{ servers = @{ dd = @{ type = 'stdio'; command = 'pwsh'; args = @('-NoProfile', '-NonInteractive', '-File', $driver, 'mcp') } } }
+                $path = Get-DDPath $Root '.vscode/mcp.json'
+                if ($Options['dry-run']) { return @{ path = $path; configuration = $configuration; status = 'planned' } }
+                if (Test-Path $path) { Stop-DD 'Existing .vscode/mcp.json is preserved. Review dd ide --mcp --dry-run and merge it manually.' }
+                [IO.Directory]::CreateDirectory((Split-Path $path)) | Out-Null
+                [IO.File]::WriteAllText($path, ($configuration | ConvertTo-Json -Depth 8))
+                return @{ registered = $path; status = 'registered' }
+            }
             if (-not $IsWindows) { Stop-DD 'Visual Studio IDE generation is Windows-only.' }
             $Root = Find-DDProject $Root
             $manifest = Read-DDManifest $Root -ForBuild
@@ -200,16 +216,21 @@ function Invoke-DDExtendedCommand([string]$Command, [string]$Root, $Options) {
             return @{ environment = @{ PATH = $env:PATH; INCLUDE = $env:INCLUDE; LIB = $env:LIB; LIBPATH = $env:LIBPATH }; note = 'Environment applies to this process only. Use the profile function dd env to import these values into PowerShell.' }
         }
         'mcp' {
-            Assert-DDOptions $Options @('register')
+            Assert-DDOptions $Options @('allow-execution')
             $server = Join-Path $script:DDHome 'mcp/server.ps1'
             if (-not (Test-Path $server)) { Stop-DD 'PowerShell MCP runtime is incomplete. Restore the source checkout or reinstall dd.' 3 }
-            $configuration = @{ servers = @{ dd = @{ type = 'stdio'; command = 'pwsh'; args = @('-NoProfile', '-NonInteractive', '-File', $server, '-Root', $Root) } } }
-            if (-not $Options.register) { return $configuration }
-            $path = Get-DDPath $Root '.vscode/mcp.json'
-            if (Test-Path $path) { Stop-DD 'Existing .vscode/mcp.json is preserved. Merge the configuration from dd mcp manually.' }
-            [IO.Directory]::CreateDirectory((Split-Path $path)) | Out-Null
-            [IO.File]::WriteAllText($path, ($configuration | ConvertTo-Json -Depth 8))
-            return @{ registered = $path }
+            if ($Options.json) { Stop-DD 'dd mcp is a stdio server: stdout carries JSON-RPC messages, so --json does not apply.' }
+            # Anchor the workspace boundary on the project root when there is one, but still
+            # serve machine-level inspection outside a project.
+            $Root = Resolve-DDProjectRoot $Root
+            # Server mode owns stdout for protocol messages, so it bypasses the result
+            # envelope entirely and exits before Invoke-DD can render anything.
+            try { & $server -Root $Root -AllowExecution:([bool]$Options['allow-execution']) }
+            catch {
+                [Console]::Error.WriteLine("dd mcp: $($_.Exception.Message)")
+                exit 1
+            }
+            exit 0
         }
         default { Stop-DD "Unknown or not yet supported command: $Command. Run dd help." }
     }

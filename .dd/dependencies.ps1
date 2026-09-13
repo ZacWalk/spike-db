@@ -52,6 +52,13 @@ function Get-DDDependencies([string]$Root) {
 function Resolve-DDDependencyCommit([string]$Root, [string]$Url, [string]$Ref) {
     if (-not $Ref -or $Ref.StartsWith('-') -or $Ref -match '[\s\x00-\x1f]') { Stop-DD 'Specify a full commit, tag or branch with --ref.' }
     if ($Ref -match '^[0-9a-fA-F]{40}$') { return $Ref.ToLowerInvariant() }
+    # Catalog declarations carry no pin, so HEAD resolves the remote default branch and
+    # the concrete commit is recorded in the project's own manifest.
+    if ($Ref -ceq 'HEAD') {
+        $head = Invoke-DDGit $Root @('ls-remote', '--exit-code', '--', $Url, 'HEAD')
+        foreach ($line in ($head.stdout -split '\r?\n')) { if ($line -match '^([0-9a-f]{40})\s+HEAD$') { return $Matches[1] } }
+        Stop-DD "Remote HEAD not found for $Url" 5
+    }
     $patterns = if ($Ref.StartsWith('refs/')) { @($Ref, "$Ref^{}") } else { @("refs/heads/$Ref", "refs/tags/$Ref", "refs/tags/$Ref^{}") }
     $remote = Invoke-DDGit $Root (@('ls-remote', '--exit-code', '--', $Url) + $patterns)
     $refs = @{}
@@ -88,7 +95,8 @@ function Install-DDDependency([string]$Root, [string]$Name, [string]$Url, [strin
         if (-not $catalog.dependencies.ContainsKey($Name)) { Stop-DD 'Unknown dependency. Use dep list --available or supply --git and --ref.' }
         if ($Ref) { Stop-DD '--ref on a new dependency requires --git.' }
         $Url = $catalog.dependencies[$Name].url
-        $Ref = $catalog.dependencies[$Name].commit
+        # The catalog carries no pins; take the remote default branch head now and record it.
+        $Ref = 'HEAD'
     }
     if ($Sha256) {
         if ($Ref -or $Sha256 -notmatch '^[0-9a-fA-F]{64}$' -or -not $Url.StartsWith('https://')) { Stop-DD 'Archive declarations require an HTTPS URL and SHA-256, not --ref.' }
