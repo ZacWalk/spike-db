@@ -309,25 +309,73 @@ SpikeDB_Status spike_db_verify (SpikeDB* db, SpikeDB_VerifyReport* out);
 ## Building
 
 Single-file C11 implementation; the only dependencies are libc and the
-OS file APIs. The build is CMake + Ninja, driven by one script:
+OS file APIs. The build is CMake + Ninja, driven by the unmodified
+[dd v0.2.0](https://github.com/ZacWalk/dd/tree/v0.2.0) runtime.
+Use PowerShell 7.4+, CMake 3.24+, Ninja and an x64 MSVC or GCC toolchain:
 
 ```powershell
-./dd.ps1 run            # build Release and run the suite  (default command)
-./dd.ps1 build          # build only
-./dd.ps1 run -Arch AVX512 -Config Debug
-./dd.ps1 audit          # build with the structural audit hook, then run
-./dd.ps1 asan           # AddressSanitizer + UBSan
-./dd.ps1 lowmem         # 16- and 32-page cache passes
-./dd.ps1 all            # everything above
-./dd.ps1 clean
+./dd.ps1 build          # build Release and Debug
+./dd.ps1 test           # full C suite + adoption checks, Release and Debug
+./dd.ps1 run            # build Release and run test_spike_db
+./dd.ps1 build debug --app spike_db
+./dd.ps1 test --app spike_db   # test the library (not an executable)
+./dd.ps1 check --arch AVX512 --config Debug --yes
+./dd.ps1 audit --yes    # structural audit hook + full suite
+./dd.ps1 asan --yes     # ASan; also UBSan with GCC
+./dd.ps1 lowmem --yes   # full suite with 16- and 32-page caches
+./dd.ps1 all --yes      # check, audit, lowmem and asan
+./dd.ps1 all --dry-run  # inspect variants without building or running
+./dd.ps1 clean both --dry-run
 ./dd.ps1 help
 ```
 
-The same script runs on Linux and in WSL under `pwsh`. On Windows it finds
-Visual Studio itself (including the 2026 layout, year directory `18`) and
-imports the MSVC environment, because Ninja drives `cl.exe` directly and
-needs it; `cmake` and `ninja` are taken from the VS install when they are
-not on `PATH`.
+The same entry point runs on Linux and in WSL under `pwsh`. dd discovers
+the Windows MSVC environment and toolchain; `./dd.ps1 doctor` diagnoses
+missing prerequisites without installing anything. Bare `./dd.ps1` shows
+help. `run` and `launch` reject the library target; `test_spike_db` is the
+default runnable CLI and still contains all 63 tests.
+
+Migration from the old driver: `-Arch` and `-Config` are now `--arch` and
+`--config` on the project commands (`check`, `audit`, `asan`, `lowmem`,
+`all`). They default to AVX2 and Release. AVX512 execution requires a
+capable CPU; CI runs AVX2. Built-in `build` takes `debug`, `release` or
+`both`; built-in `test` always runs both configurations. The legacy quick
+hint is available as `--quick true` on project commands, but never skips
+tests. Project commands write disposable build/test data, so unattended
+execution requires `--yes`; `--dry-run` does not write it.
+
+Native builds retain the CMake target/output names in
+`build/<platform>/<configuration>/`: `spike_db.lib` on MSVC,
+`libspike_db.a` on GCC, and `test_spike_db[.exe]`. Verification variants
+use `build/<platform>/variants/<pass>-<arch>/<configuration>/`.
+CTest writes scratch files beneath each build's `tmp/`; direct `dd run`
+uses the repository's `tmp/`. Do not run two direct suites concurrently
+in the same working directory.
+
+`clean both --yes` removes only dd-verified normal build directories,
+not variant directories, old `win-*`/`lin-*` builds, or repository scratch
+files. Review `--dry-run` before cleanup.
+
+### Adoption contract
+
+[dd.psd1](dd.psd1) owns target/command metadata;
+[CMakePresets.json](CMakePresets.json) owns native and variant presets.
+There are no external dependencies; CMake retains dependency ownership.
+[scripts/verify.ps1](scripts/verify.ps1) consumes dd's JSON project-command
+protocol and reuses the pinned runtime's configure/build/CTest functions.
+It supplies variant options through process-local preset environment
+variables and uses separate dd state keys, never rewriting the manifest,
+presets or standard build state. Standard presets explicitly reset variant
+options, so a previous audit, AVX512 or sanitizer run cannot leak into them.
+
+[tests/dd-adoption.ps1](tests/dd-adoption.ps1) checks the library/CLI
+contract, command validation, non-mutating dry-runs and every vendored
+SHA-256 (including templates). [docs/dd-upstream.json](docs/dd-upstream.json)
+records the full commit behind the release tag. When updating dd, export
+`dd.ps1` and `.dd/` from the reviewed tag, regenerate every fingerprint,
+update the test's expected release and validate on Windows and Linux.
+Keep the `-text` rules in [.gitattributes](.gitattributes): fingerprints
+must also pass from a fresh checkout. Do not edit vendored code in place.
 
 To build against the library directly, `src/spike_db.c` plus `src/spike_db.h`
 is the whole of it — `spike_db_internal.h` exists only for the test suite.
@@ -368,4 +416,3 @@ change; it is the top item in [docs/testing.md](docs/testing.md) §6.
 Until then, treat SpikeDB as a store whose system of record is upstream
 (the exchange, the vendor file) and use the transactional ingest cursor
 (`spike_db_batch_put_meta`) to resume after a restart.
-

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "dependencies": {
+    "platform-h": { "url": "https://github.com/ZacWalk/platform-h.git", "commit": "8e9be5de233d1797ce7a2b50fe663042469611a9" },
+    "spike-db": { "url": "https://github.com/ZacWalk/spike-db.git", "commit": "a2e4c3c598b31027b9433a6f6e4e538122067ad9" }
+  }
+}
