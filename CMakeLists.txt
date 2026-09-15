@@ -44,7 +44,10 @@ endif()
 
 if(SPIKEDB_SANITIZE)
     if(MSVC)
+        # CMake's Debug defaults enable runtime checks incompatible with ASan.
+        string(REGEX REPLACE "/RTC[1su]+" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
         target_compile_options(spike_db PUBLIC /fsanitize=address)
+        target_link_options(spike_db PUBLIC /INCREMENTAL:NO)
     else()
         target_compile_options(spike_db PUBLIC
             -fsanitize=address,undefined -fno-omit-frame-pointer -g)
@@ -53,8 +56,7 @@ if(SPIKEDB_SANITIZE)
 endif()
 
 # ------------------------------------------------------------------- tests ---
-# The suite writes to tmp/ relative to the working directory, so run it from
-# the repository root (dd.ps1 does).
+# CTest uses a per-build tmp/ so different variants never share test databases.
 add_executable(test_spike_db src/test_spike_db.c)
 target_link_libraries(test_spike_db PRIVATE spike_db)
 
@@ -66,7 +68,19 @@ if(MSVC)
     target_compile_definitions(test_spike_db PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-enable_testing()
-add_test(NAME suite
-         COMMAND test_spike_db
-         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME suite
+             COMMAND test_spike_db
+             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(suite PROPERTIES LABELS spike_db TIMEOUT 120)
+    find_program(POWERSHELL_EXECUTABLE NAMES pwsh)
+    if(POWERSHELL_EXECUTABLE)
+        add_test(NAME dd_adoption
+                 COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -File
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/dd-adoption.ps1")
+        set_tests_properties(dd_adoption PROPERTIES LABELS adoption TIMEOUT 120)
+    else()
+        message(STATUS "PowerShell not found; skipping dd adoption test (C suite remains enabled)")
+    endif()
+endif()

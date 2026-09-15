@@ -1,0 +1,70 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "SPIKEDB_AVX512": "OFF",
+        "SPIKEDB_AUDIT": "OFF",
+        "SPIKEDB_SANITIZE": "OFF",
+        "SPIKEDB_TEST_CACHE": ""
+      }
+    },
+    {
+      "name": "windows",
+      "hidden": true,
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "cacheVariables": { "CMAKE_C_COMPILER": "cl" }
+    },
+    {
+      "name": "linux",
+      "hidden": true,
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "CMAKE_C_COMPILER": "gcc" }
+    },
+    {
+      "name": "variant",
+      "hidden": true,
+      "cacheVariables": {
+        "SPIKEDB_AVX512": "$penv{SPIKEDB_AVX512}",
+        "SPIKEDB_AUDIT": "$penv{SPIKEDB_AUDIT}",
+        "SPIKEDB_SANITIZE": "$penv{SPIKEDB_SANITIZE}",
+        "SPIKEDB_TEST_CACHE": "$penv{SPIKEDB_TEST_CACHE}"
+      }
+    },
+    { "name": "windows-debug", "inherits": "windows", "binaryDir": "${sourceDir}/build/x64-windows/debug", "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "windows-release", "inherits": "windows", "binaryDir": "${sourceDir}/build/x64-windows/release", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+    { "name": "linux-debug", "inherits": "linux", "binaryDir": "${sourceDir}/build/x64-linux/debug", "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "linux-release", "inherits": "linux", "binaryDir": "${sourceDir}/build/x64-linux/release", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+    { "name": "windows-variant-debug", "inherits": ["variant", "windows-debug"], "binaryDir": "${sourceDir}/build/x64-windows/variants/$penv{SPIKEDB_VARIANT}/debug" },
+    { "name": "windows-variant-release", "inherits": ["variant", "windows-release"], "binaryDir": "${sourceDir}/build/x64-windows/variants/$penv{SPIKEDB_VARIANT}/release" },
+    { "name": "linux-variant-debug", "inherits": ["variant", "linux-debug"], "binaryDir": "${sourceDir}/build/x64-linux/variants/$penv{SPIKEDB_VARIANT}/debug" },
+    { "name": "linux-variant-release", "inherits": ["variant", "linux-release"], "binaryDir": "${sourceDir}/build/x64-linux/variants/$penv{SPIKEDB_VARIANT}/release" }
+  ],
+  "buildPresets": [
+    { "name": "windows-debug", "configurePreset": "windows-debug" },
+    { "name": "windows-release", "configurePreset": "windows-release" },
+    { "name": "linux-debug", "configurePreset": "linux-debug" },
+    { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "windows-variant-debug", "configurePreset": "windows-variant-debug" },
+    { "name": "windows-variant-release", "configurePreset": "windows-variant-release" },
+    { "name": "linux-variant-debug", "configurePreset": "linux-variant-debug" },
+    { "name": "linux-variant-release", "configurePreset": "linux-variant-release" }
+  ],
+  "testPresets": [
+    { "name": "windows-debug", "configurePreset": "windows-debug" },
+    { "name": "windows-release", "configurePreset": "windows-release" },
+    { "name": "linux-debug", "configurePreset": "linux-debug" },
+    { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "windows-variant-debug", "configurePreset": "windows-variant-debug" },
+    { "name": "windows-variant-release", "configurePreset": "windows-variant-release" },
+    { "name": "linux-variant-debug", "configurePreset": "linux-variant-debug" },
+    { "name": "linux-variant-release", "configurePreset": "linux-variant-release" }
+  ]
+}

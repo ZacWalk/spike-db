@@ -1,0 +1,2 @@
+/dd.ps1 -text whitespace=cr-at-eol
+/.dd/** -text whitespace=cr-at-eol

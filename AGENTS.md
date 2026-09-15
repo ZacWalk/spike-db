@@ -26,7 +26,12 @@ src/spike_db.h            public header + API contracts
 src/spike_db_internal.h   test-only hooks (I/O table, CRC probe, audit)
 src/test_spike_db.c       test suite (self-contained harness, no framework)
 CMakeLists.txt            build definition (CMake + Ninja)
-dd.ps1                    the only script: build, run, audit, asan, lowmem
+dd.ps1 + .dd/             unmodified dd v0.2.0 runtime (do not fork)
+dd.psd1                   library/CLI metadata and project commands
+CMakePresets.json         native and isolated verification presets
+scripts/verify.ps1        project-command adapter using dd build/test helpers
+tests/dd-adoption.ps1     provenance, presets, targets and command contract
+docs/dd-upstream.json     reviewed release commit and every vendored SHA-256
 docs/design.md            internals reference
 docs/testing.md           testing strategy and planned work
 tmp/                      scratch: test DB files, logs, any temp artifact
@@ -36,32 +41,46 @@ build/                    build output, one directory per variant
 ## Build and test
 
 ```powershell
-./dd.ps1 run                    # build Release + run the suite (default)
-./dd.ps1 build                  # build only
-./dd.ps1 run -Arch AVX512 -Config Debug
-./dd.ps1 audit                  # -DSPIKEDB_AUDIT: structural audit hook
-./dd.ps1 asan                   # ASan + UBSan
-./dd.ps1 lowmem                 # 16- and 32-page cache passes
-./dd.ps1 all                    # everything
-./dd.ps1 clean
+./dd.ps1 build                  # Release and Debug
+./dd.ps1 test                   # C suite + adoption test, both configurations
+./dd.ps1 run                    # Release test CLI; bare dd shows help
+./dd.ps1 build debug --app spike_db
+./dd.ps1 test --app spike_db     # library-scoped C suite
+./dd.ps1 check --arch AVX512 --config Debug --yes
+./dd.ps1 audit --yes            # -DSPIKEDB_AUDIT: structural audit hook
+./dd.ps1 asan --yes             # ASan (also UBSan on GCC)
+./dd.ps1 lowmem --yes           # 16- and 32-page cache passes
+./dd.ps1 all --yes              # check, audit, lowmem, asan
+./dd.ps1 all --dry-run
+./dd.ps1 clean both --dry-run
 ```
 
-- CMake + Ninja. On Windows `dd.ps1` locates Visual Studio and imports the
-  MSVC environment itself (VS year dirs `18`/`2026`/`2025`/`2022`/`2019`),
-  because Ninja drives `cl.exe` directly and needs it; it also falls back
-  to the `cmake`/`ninja` inside the VS install when they are not on PATH.
-- The same script runs under `pwsh` on Linux and in WSL. Build directories
-  are namespaced by platform (`build/win-*`, `build/lin-*`) so a Windows
-  and a WSL build of the same tree do not fight over one CMake cache.
-- Binary: `build/<platform>-<config>-<arch>/test_spike_db[.exe]`.
-- `-Quick` only sets `SPIKEDB_TEST_MODE=quick`, which the test binary
-  currently ignores. CI uses it, so it must stay harmless.
-- CI (`.github/workflows/ci.yml`) runs `dd.ps1 run`, `audit` and `lowmem`
-  on `windows-latest` and `ubuntu-latest`, plus `asan` on Linux. Keep both
-  paths compiling.
+- PowerShell 7.4+, CMake 3.24+, Ninja, x64 MSVC/GCC. dd owns toolchain
+  discovery; `dd doctor` diagnoses prerequisites without installing them.
+- Standard artifacts: `build/<platform>/<config>/spike_db.lib` (MSVC) or
+  `libspike_db.a` (GCC), plus `test_spike_db[.exe]`. Platforms are
+  `x64-windows` and `x64-linux`. Never hard-code platform archive suffixes
+  in dd metadata; use `{libprefix}` and `{lib}`.
+- Project commands use `build/<platform>/variants/<pass>-<arch>/<config>/`
+  and separate dd state keys. They reuse pinned dd functions, not a
+  second compiler-discovery/build implementation. Validate the adapter
+  when updating dd. Never edit `.dd/` or `dd.ps1` locally.
+- `--arch AVX2|AVX512`, `--config Release|Debug` and `--quick true|false`
+  are project-command parameters, not built-in dd flags. `check` replaces
+  the old `run -Arch ... -Config ...`. AVX512 requires a capable CPU.
+  The quick hint sets `SPIKEDB_TEST_MODE` but does not shorten the suite.
+- CI (`.github/workflows/ci.yml`) runs `dd test`, `audit`, `lowmem` and
+  `asan` on `windows-latest` and `ubuntu-latest`. MSVC has ASan only;
+  GCC has ASan + UBSan. Windows CI checks sanitizer Debug compatibility.
+- `clean both --yes` only cleans dd-verified standard builds, not variants,
+  legacy builds or repository scratch. Always preview with `--dry-run`.
+- Preserve `.gitattributes` byte-stability for the vendored runtime.
+  Regenerate all fingerprints on upgrades and test from a fresh checkout.
 
-**Always write scratch files to `tmp/`, never the repo root.** The test
-suite creates `tmp/` itself and uses `tmp/test_spike_db.dat`.
+**Always write scratch files to `tmp/`, never the repo root.** The C suite
+uses `tmp/test_spike_db.dat` relative to its working directory. CTest runs
+inside each build tree to isolate variants; `dd run` uses the repo root.
+Do not run concurrent direct suites in the same working directory.
 
 ## Coding conventions
 
@@ -94,7 +113,7 @@ suite creates `tmp/` itself and uses `tmp/test_spike_db.dat`.
   variable-width slot directory; non-zero is a fixed columnar leaf with no
   slots at all. Read through `leaf_find` / `leaf_key_at` / `leaf_val_at`,
   and only call `leaf_slots()` after checking `record_size == 0` —
-  otherwise you are reinterpreting the `times[]` column as slots.
+    otherwise you are reinterpreting the `times[]` column as slots.
 - **Every pin needs a matching unpin on every path, including errors.**
   A leaked pin starves the clock sweep and surfaces much later as
   `SPIKEDB_FULL` from an unrelated write. `./dd.ps1 lowmem` and
