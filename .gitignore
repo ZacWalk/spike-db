@@ -1,3 +1,5 @@
 build/
 tmp/
-.vscode/
+/.vscode/
+.dd/state/
+*.dd-backup-*

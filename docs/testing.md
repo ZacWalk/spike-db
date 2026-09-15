@@ -59,10 +59,21 @@ Verification passes CI runs on every push:
 
 | Pass | Command | Catches |
 |---|---|---|
-| Default | `dd.ps1 run` | Functional regressions on MSVC and GCC |
-| Audit | `dd.ps1 audit` | Cache/hash-table/pin invariants at the exit of every mutating call (§5) |
-| ASan + UBSan | `dd.ps1 asan` | Out-of-bounds, misaligned loads, leaks |
-| Low-memory | `dd.ps1 lowmem` (16 and 32 pages) | Leaked page pins, which surface as `SPIKEDB_FULL` once the clock sweep runs out of victims |
+| Default | `dd.ps1 test` | All 63 functional tests plus dd adoption checks, in Release and Debug on MSVC and GCC |
+| Audit | `dd.ps1 audit --yes` | Cache/hash-table/pin invariants at the exit of every mutating call (§5) |
+| Sanitizers | `dd.ps1 asan --yes` (Windows CI adds `--config Debug`) | ASan on MSVC; ASan + UBSan on GCC: out-of-bounds, misaligned loads, leaks |
+| Low-memory | `dd.ps1 lowmem --yes` (16 and 32 pages) | Leaked page pins, which surface as `SPIKEDB_FULL` once the clock sweep runs out of victims |
+
+The project commands default to Release/AVX2 and accept `--config Debug`,
+`--arch AVX512` and the harmless legacy hint `--quick true`. Use
+`dd.ps1 check --config Debug --yes` for a single-configuration functional
+pass, or `dd.ps1 all --yes` for every variant. `--dry-run` returns the
+planned cache flags and build paths without changing build state.
+Variant CTest runs select only `suite`; the normal `dd test` also runs
+`dd_adoption`, which checks the byte-pinned runtime and adapter contract.
+CTest runs in each build directory and creates its own `tmp/`, so Windows,
+WSL, Debug, Release and cache/sanitizer variants do not share test databases.
+Direct `dd run` still uses the repository's `tmp/`.
 | Layout guards | any build | `SPDB_STATIC_ASSERT` fails the build if a packed struct changes size or a capacity would overrun the checksum trailer |
 
 The low-memory pass is the cheap proxy for the pin-balance audit in §5:
