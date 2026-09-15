@@ -69,8 +69,14 @@ The project commands default to Release/AVX2 and accept `--config Debug`,
 `dd.ps1 check --config Debug --yes` for a single-configuration functional
 pass, or `dd.ps1 all --yes` for every variant. `--dry-run` returns the
 planned cache flags and build paths without changing build state.
-Variant CTest runs select only `suite`; the normal `dd test` also runs
+Variant CTest runs select tests labelled `spike_db`; the normal `dd test` also runs
 `dd_adoption`, which checks the byte-pinned runtime and adapter contract.
+On GCC, sanitizer builds disable UBSan recovery so findings fail the command
+and remain visible with CTest's `--output-on-failure`. Sanitizer passes also
+run `ubsan_failure`: a signed-overflow probe inheriting the library's sanitizer
+flags must fail a nested CTest run and expose its UBSan diagnostic, even with
+`UBSAN_OPTIONS=halt_on_error=0`. This check is not built on MSVC or in
+non-sanitizer configurations.
 CTest runs in each build directory and creates its own `tmp/`, so Windows,
 WSL, Debug, Release and cache/sanitizer variants do not share test databases.
 Direct `dd run` still uses the repository's `tmp/`.

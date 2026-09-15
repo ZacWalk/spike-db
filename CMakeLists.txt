@@ -50,7 +50,8 @@ if(SPIKEDB_SANITIZE)
         target_link_options(spike_db PUBLIC /INCREMENTAL:NO)
     else()
         target_compile_options(spike_db PUBLIC
-            -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+            -fsanitize=address,undefined -fno-sanitize-recover=undefined
+            -fno-omit-frame-pointer -g)
         target_link_options(spike_db PUBLIC -fsanitize=address,undefined)
     endif()
 endif()
@@ -74,6 +75,16 @@ if(BUILD_TESTING)
              COMMAND test_spike_db
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     set_tests_properties(suite PROPERTIES LABELS spike_db TIMEOUT 120)
+    if(SPIKEDB_SANITIZE AND NOT MSVC)
+        add_executable(ubsan_failure_probe tests/ubsan-failure.c)
+        target_link_libraries(ubsan_failure_probe PRIVATE spike_db)
+        add_test(NAME ubsan_failure
+                 COMMAND "${CMAKE_COMMAND}"
+                         "-DPROBE=$<TARGET_FILE:ubsan_failure_probe>"
+                         "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/tmp/ubsan-failure/$<CONFIG>"
+                         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ubsan-failure.cmake")
+        set_tests_properties(ubsan_failure PROPERTIES LABELS spike_db TIMEOUT 30)
+    endif()
     find_program(POWERSHELL_EXECUTABLE NAMES pwsh)
     if(POWERSHELL_EXECUTABLE)
         add_test(NAME dd_adoption
