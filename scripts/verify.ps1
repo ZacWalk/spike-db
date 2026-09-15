@@ -60,7 +60,7 @@ if (-not $request.dryRun) {
         $stateKey = "$($plan.variant)-$config"
         $manifest.build[$platform][$stateKey] = $plan.preset
         $results += Invoke-DDBuild $root $manifest $stateKey @{}
-        $results += Invoke-DDTests $root $manifest $stateKey @{ name = '^suite$' } @()
+        $results += Invoke-DDTests $root $manifest $stateKey @{ label = '^spike_db$' } @()
     }
 }
 @{
