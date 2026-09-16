@@ -314,6 +314,8 @@ OS file APIs. The build is CMake + Ninja, driven by the unmodified
 Use PowerShell 7.4+, CMake 3.24+, Ninja and an x64 MSVC or GCC toolchain:
 
 ```powershell
+./dd.ps1 dep install --non-interactive
+./dd.ps1 doctor --non-interactive
 ./dd.ps1 build          # build Release and Debug
 ./dd.ps1 test           # full C suite + adoption checks, Release and Debug
 ./dd.ps1 run            # build Release and run test_spike_db
@@ -334,6 +336,14 @@ the Windows MSVC environment and toolchain; `./dd.ps1 doctor` diagnoses
 missing prerequisites without installing anything. Bare `./dd.ps1` shows
 help. `run` and `launch` reject the library target; `test_spike_db` is the
 default runnable CLI and still contains all 63 tests.
+
+CI runs on Windows and Linux for pushes, pull requests and manual dispatch.
+It validates dependency declarations, checks the toolchain, then builds/tests
+Release and Debug before the audit, low-memory and sanitizer passes. Linux
+installs `g++ cmake ninja-build` (dd requires G++ even for this C library).
+Checkout credentials are not retained. Failure artifacts contain only build
+logs and test reports, never databases; CI scopes `TEMP`, `TMP` and `TMPDIR`
+to the checkout's `tmp/`.
 
 Migration from the old driver: `-Arch` and `-Config` are now `--arch` and
 `--config` on the project commands (`check`, `audit`, `asan`, `lowmem`,
