@@ -129,4 +129,29 @@ $null = Invoke-Driver @('audit') 2
 $stateAfter = @(Get-ChildItem (Join-Path $root '.dd/state') -File -ErrorAction SilentlyContinue |
     ForEach-Object { "$($_.Name):$((Get-FileHash $_.FullName).Hash)" })
 if (($stateBefore -join "`n") -ne ($stateAfter -join "`n")) { throw 'Dry-runs and invalid requests must not change build state.' }
-Write-Host 'PASS pinned runtime, presets, library selection, variant plans, validation and non-mutating dry-runs'
+$null = Invoke-Driver @('build', 'invalid') 2
+
+$workflow = Get-Content (Join-Path $root '.github/workflows/ci.yml') -Raw
+foreach ($required in @('  push:', '  pull_request:', '  workflow_dispatch:', 'contents: read',
+    'actions/checkout@v5', 'persist-credentials: false', 'windows-latest', 'ubuntu-latest',
+    'g++ cmake ninja-build', 'dd.ps1 dep install --non-interactive',
+    'dd.ps1 doctor --non-interactive', 'dd.ps1 test --non-interactive',
+    'dd.ps1 audit --yes --non-interactive', 'dd.ps1 lowmem --yes --non-interactive',
+    'dd.ps1 asan --config Debug --yes --non-interactive', 'dd.ps1 asan --yes --non-interactive',
+    'if: failure()', 'tmp/**/dd-ctest-*.xml', 'build/**/Testing/Temporary/*.log')) {
+    if (-not $workflow.Contains($required)) { throw "CI contract missing: $required" }
+}
+$badge = 'https://github.com/ZacWalk/spike-db/actions/workflows/ci.yml'
+if (-not (Get-Content (Join-Path $root 'README.md') -Raw).Contains("($badge/badge.svg)]($badge)")) {
+    throw 'README badge must target this repository and workflow'
+}
+$drivers = @(Get-ChildItem -LiteralPath $root -File -Filter '*.ps1')
+if ($drivers.Count -ne 1 -or $drivers[0].Name -ne 'dd.ps1' -or (Test-Path (Join-Path $root 'dd.sh'))) {
+    throw 'Only immutable dd may remain as a root driver'
+}
+foreach ($path in @('dd.ps1', 'tests/dd-adoption.ps1') + @($manifest.commands.Values.script | Sort-Object -Unique)) {
+    $tokens = $null; $parseErrors = $null
+    $null = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root $path), [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw "PowerShell parse failed: $path : $parseErrors" }
+}
+Write-Host 'PASS pinned runtime, presets, library selection, variant plans, validation, CI/badge contract and script parsing'
