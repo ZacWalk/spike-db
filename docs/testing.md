@@ -55,7 +55,13 @@ And five reach the failure paths through the injectable I/O table:
 | `test_lock_failure_is_reported` | Nothing proceeds without the lock it asked for, and no lock is leaked when acquisition fails |
 | `test_handle_invariants_hold` | `spike_db_internal_check` is clean after open, write, scan, truncate, delete, drop, and after an aborted transaction |
 
-Verification passes CI runs on every push:
+CI runs on Windows and Linux for every push, pull request and manual dispatch.
+It first runs `dd.ps1 dep install --non-interactive` and
+`dd.ps1 doctor --non-interactive`; all verification commands are non-interactive.
+Failed jobs retain only logs and JUnit/CTest reports for seven days, not test
+databases or other persistent data.
+
+Verification passes:
 
 | Pass | Command | Catches |
 |---|---|---|
@@ -71,6 +77,9 @@ pass, or `dd.ps1 all --yes` for every variant. `--dry-run` returns the
 planned cache flags and build paths without changing build state.
 Variant CTest runs select tests labelled `spike_db`; the normal `dd test` also runs
 `dd_adoption`, which checks the byte-pinned runtime and adapter contract.
+It also checks CI platforms/lifecycle, the README badge and the single root
+driver, parses the actual PowerShell entry points and rejects invalid build
+configurations before configuring.
 On GCC, sanitizer builds disable UBSan recovery so findings fail the command
 and remain visible with CTest's `--output-on-failure`. Sanitizer passes also
 run `ubsan_failure`: a signed-overflow probe inheriting the library's sanitizer

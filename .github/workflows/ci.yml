@@ -2,57 +2,77 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/checkout@v5
         with:
-          arch: x64
+          persist-credentials: false
 
-      - name: Build and test
-        run: pwsh -File dd.ps1 test
+      - name: Keep scratch files in the checkout
+        run: |
+          $scratch = Join-Path $PWD 'tmp'
+          New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+          "TEMP=$scratch", "TMP=$scratch", "TMPDIR=$scratch" | Add-Content $env:GITHUB_ENV
+
+      - name: Install Linux native tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build
+
+      - name: Validate pinned CMake dependency declarations
+        run: pwsh -NoProfile -File dd.ps1 dep install --non-interactive
+
+      - name: Check native toolchain and dependencies
+        run: pwsh -NoProfile -File dd.ps1 doctor --non-interactive
+
+      - name: Build and test Debug and Release
+        run: pwsh -NoProfile -File dd.ps1 test --non-interactive
 
       # The structural audit walks the page cache and hash table at the exit
       # of every mutating call. It perturbs cache timing, so it is a separate
       # pass rather than the default.
       - name: Audit build
-        run: pwsh -File dd.ps1 audit --yes
+        run: pwsh -NoProfile -File dd.ps1 audit --yes --non-interactive
 
       # A leaked page pin is invisible at the default 32 MiB cache and
       # surfaces as SPIKEDB_FULL once the clock sweep runs out of victims.
       - name: Low-memory passes
-        run: pwsh -File dd.ps1 lowmem --yes
+        run: pwsh -NoProfile -File dd.ps1 lowmem --yes --non-interactive
 
       - name: Sanitizers (ASan, including Debug flag compatibility)
-        run: pwsh -File dd.ps1 asan --config Debug --yes
-
-  linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc cmake ninja-build
-
-      - name: Build and test
-        run: pwsh -File dd.ps1 test
-
-      - name: Audit build
-        run: pwsh -File dd.ps1 audit --yes
-
-      - name: Low-memory passes
-        run: pwsh -File dd.ps1 lowmem --yes
+        if: runner.os == 'Windows'
+        run: pwsh -NoProfile -File dd.ps1 asan --config Debug --yes --non-interactive
 
       # The fixed-width leaf layout casts uint64_t/uint32_t into a packed
       # page, so misalignment and out-of-bounds are the failure modes that
       # matter most here.
-      - name: Sanitizers (ASan + UBSan)
-        run: pwsh -File dd.ps1 asan --yes
+      - name: Sanitizers (ASan + fatal UBSan)
+        if: runner.os == 'Linux'
+        run: pwsh -NoProfile -File dd.ps1 asan --yes --non-interactive
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-db-${{ runner.os }}-diagnostics
+          path: |
+            tmp/**/dd-logs/*.log
+            tmp/**/dd-ctest-*.xml
+            build/**/Testing/Temporary/*.log
+            build/**/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
+          retention-days: 7
