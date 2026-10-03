@@ -40,6 +40,14 @@ build/                    build output, one directory per variant
 
 ## Build and test
 
+SpikeDB vendors the upstream dd driver without local changes; see
+[docs/dd-upstream.json](docs/dd-upstream.json) for the recorded hashes.
+`dd.psd1` is the home for target and project-command metadata, and this library
+does not declare external dependency pins. Inspect local commands with
+`.\dd.ps1 commands --json`; the upstream dd docs cover
+[CLI/MCP modes](https://github.com/ZacWalk/dd/blob/main/docs/mcp.md#two-modes)
+and the shared [command reference](https://github.com/ZacWalk/dd/blob/main/docs/cli.md#commands).
+
 ```powershell
 ./dd.ps1 build                  # Release and Debug
 ./dd.ps1 test                   # C suite + adoption test, both configurations
@@ -179,24 +187,3 @@ framework.
   handling or the transaction paths.
 - [docs/testing.md](docs/testing.md) describes the wider strategy (fault
   injection, invariant audits, power-loss simulation, coverage goals).
-
-## dd modes
-
-dd has two modes, and the command line selects between them.
-
-**CLI mode** is the default and the single behavior owner. Each verb runs once,
-prints one schema 1 result envelope and exits:
-
-```pwsh
-pwsh -NoProfile -File ./dd.ps1 test --json
-pwsh -NoProfile -File ./dd.ps1 build debug
-```
-
-**MCP mode** starts with `dd mcp`. The process becomes a stdio JSON-RPC server and
-stays alive until stdin closes, adapting typed MCP requests onto CLI mode — each
-tool call runs as a child `dd` invocation and returns that command's envelope.
-
-MCP mode owns stdout for protocol messages, so it prints no result envelope,
-rejects `--json`, and sends diagnostics to stderr. Its workspace boundary is the
-project root. Register the client configuration with `dd ide --mcp`; add
-`--allow-execution` only when project-code execution is intended.
