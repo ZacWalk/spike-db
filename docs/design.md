@@ -1,7 +1,7 @@
 # SpikeDB Design
 
-Reference description of the code in [src/spike_db.c](src/spike_db.c) and
-[src/spike_db.h](src/spike_db.h). It documents what the implementation does
+Reference description of the code in [src/spike_db.c](../src/spike_db.c) and
+[src/spike_db.h](../src/spike_db.h). It documents what the implementation does
 today, not a roadmap.
 
 ---
