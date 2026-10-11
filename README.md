@@ -324,7 +324,7 @@ SpikeDB_Status spike_db_verify (SpikeDB* db, SpikeDB_VerifyReport* out);
 
 Single-file C11 implementation; the only dependencies are libc and the
 OS file APIs. The build is CMake + Ninja, driven by the unmodified
-[dd v0.2.1](https://github.com/ZacWalk/dd/tree/v0.2.1) runtime.
+[dd v0.2.2](https://github.com/ZacWalk/dd/tree/v0.2.2) runtime.
 Use PowerShell 7.4+, CMake 3.24+, Ninja and an x64 MSVC or GCC toolchain:
 
 ```powershell
