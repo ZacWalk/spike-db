@@ -24,6 +24,7 @@
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
+  #include <io.h>          /* _open_osfhandle, _fdopen: backup destination */
   #include <intrin.h>      /* __cpuid, _mm_crc32_* */
   #include <nmmintrin.h>   /* _mm_crc32_u64 */
   typedef HANDLE spdb_fd_t;
@@ -395,6 +396,11 @@ struct SpikeDB {
     bool               cache_oom;
 
     SpikeDB_Error      last_error;
+
+    /* Bumped by every recorded failure. A reader that only sees NULL or
+     * "not found" from a helper (the iterator, read_range) compares it to
+     * tell a damaged or unreadable page from the end of the data. */
+    uint64_t           err_gen;
 };
 
 /*============================================================================
@@ -416,9 +422,52 @@ static SpikeDB_Status set_err(SpikeDB* db, SpikeDB_Status st, int os_err,
         db->last_error.os_error = os_err;
         db->last_error.page     = page;
         snprintf(db->last_error.message, sizeof(db->last_error.message), "%s", msg);
+        db->err_gen++;
     }
     return st;
 }
+
+/*============================================================================
+ * Paths
+ *
+ * Paths are UTF-8 on every platform. Windows needs them as UTF-16; the ANSI
+ * file APIs would read UTF-8 bytes in the process code page and miss any
+ * file whose name is not plain ASCII. A string that is not valid UTF-8 is
+ * passed to the ANSI API unchanged, so callers that still hand in
+ * code-page paths keep working.
+ *============================================================================*/
+
+#ifdef _WIN32
+static HANDLE path_create_file(const char* path, DWORD access, DWORD creation) {
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (n <= 0)
+        return CreateFileA(path, access, share, NULL, creation, FILE_ATTRIBUTE_NORMAL, NULL);
+    wchar_t* wide = (wchar_t*)malloc((size_t)n * sizeof(wchar_t));
+    if (!wide) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, n);
+    HANDLE h = CreateFileW(wide, access, share, NULL, creation, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD err = GetLastError();
+    free(wide);
+    SetLastError(err);
+    return h;
+}
+
+static bool same_file(HANDLE a, HANDLE b) {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
+    /* 128-bit ids: ReFS does not keep the 64-bit index below unique. */
+    FILE_ID_INFO ia, ib;
+    if (GetFileInformationByHandleEx(a, FileIdInfo, &ia, sizeof(ia)) &&
+        GetFileInformationByHandleEx(b, FileIdInfo, &ib, sizeof(ib)))
+        return ia.VolumeSerialNumber == ib.VolumeSerialNumber &&
+               memcmp(&ia.FileId, &ib.FileId, sizeof(ia.FileId)) == 0;
+#endif
+    BY_HANDLE_FILE_INFORMATION fa, fb;
+    return GetFileInformationByHandle(a, &fa) && GetFileInformationByHandle(b, &fb) &&
+           fa.dwVolumeSerialNumber == fb.dwVolumeSerialNumber &&
+           fa.nFileIndexHigh == fb.nFileIndexHigh && fa.nFileIndexLow == fb.nFileIndexLow;
+}
+#endif
 
 /*============================================================================
  * I/O helpers
@@ -483,16 +532,27 @@ static SpikeDB_Status io_fsync_os(SpikeDB* db) {
     return set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE, "fsync failed");
 }
 
+/* An installed table may fail without describing why; record it here so
+ * last_error and err_gen always see every failed read, write and fsync. */
+static SpikeDB_Status io_noted(SpikeDB* db, uint64_t gen, SpikeDB_Status st,
+                               uint64_t page, const char* msg) {
+    if (st != SPIKEDB_OK && db->err_gen == gen) set_err(db, st, 0, page, msg);
+    return st;
+}
+
 static SpikeDB_Status io_read(SpikeDB* db, uint32_t page_id, void* buf) {
-    return db->io->read(db, page_id, buf);
+    uint64_t gen = db->err_gen;
+    return io_noted(db, gen, db->io->read(db, page_id, buf), page_id, "page read failed");
 }
 
 static SpikeDB_Status io_write(SpikeDB* db, uint32_t page_id, const void* buf) {
-    return db->io->write(db, page_id, buf);
+    uint64_t gen = db->err_gen;
+    return io_noted(db, gen, db->io->write(db, page_id, buf), page_id, "page write failed");
 }
 
 static SpikeDB_Status io_fsync(SpikeDB* db) {
-    return db->io->fsync(db);
+    uint64_t gen = db->err_gen;
+    return io_noted(db, gen, db->io->fsync(db), SPIKEDB_INVALID_PAGE, "fsync failed");
 }
 
 /* Forward decl: needed by db_refresh_meta below. */
@@ -575,7 +635,9 @@ void* spike_db_internal_io_ctx(SpikeDB* db) {
 }
 
 static SpikeDB_Status file_lock(SpikeDB* db, bool exclusive) {
-    return db->io->lock(db, exclusive);
+    uint64_t gen = db->err_gen;
+    return io_noted(db, gen, db->io->lock(db, exclusive), SPIKEDB_INVALID_PAGE,
+                    exclusive ? "exclusive file lock failed" : "shared file lock failed");
 }
 
 static void file_unlock(SpikeDB* db) {
@@ -603,7 +665,8 @@ static SpikeDB_Status db_refresh_meta(SpikeDB* db) {
     uint64_t new_txn;
     bool va = meta_validate(&a) == SPIKEDB_OK;
     bool vb = meta_validate(&b) == SPIKEDB_OK;
-    if (!va && !vb) return SPIKEDB_CORRUPT;
+    if (!va && !vb)
+        return set_err(db, SPIKEDB_CORRUPT, 0, SPIKEDB_INVALID_PAGE, "no valid meta page");
     if (va && vb) { new_active = (a.txn_id >= b.txn_id) ? 0 : 1; }
     else { new_active = va ? 0 : 1; }
     new_txn = (new_active == 0) ? a.txn_id : b.txn_id;
@@ -2245,6 +2308,7 @@ SpikeDB_Status spike_db_open(SpikeDB** out, const char* path,
 
     SpikeDB* db = (SpikeDB*)calloc(1, sizeof(SpikeDB));
     if (!db) return SPIKEDB_ERROR;
+    SpikeDB_Status fail_status = SPIKEDB_ERROR;
     db->fd = SPDB_INVALID_FD;
     db->io = &spike_db_internal_io_os;
     db->last_error.page = SPIKEDB_INVALID_PAGE;
@@ -2253,10 +2317,8 @@ SpikeDB_Status spike_db_open(SpikeDB** out, const char* path,
     /* Open file. In read-only mode we do NOT create a missing file. */
 #ifdef _WIN32
     DWORD access   = db->readonly ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
-    DWORD share    = FILE_SHARE_READ | FILE_SHARE_WRITE;
     DWORD creation = db->readonly ? OPEN_EXISTING : OPEN_ALWAYS;
-    db->fd = CreateFileA(path, access, share, NULL, creation,
-                         FILE_ATTRIBUTE_NORMAL, NULL);
+    db->fd = path_create_file(path, access, creation);
     if (db->fd == SPDB_INVALID_FD) { free(db); return SPIKEDB_ERROR; }
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(db->fd, &sz)) { CloseHandle(db->fd); free(db); return SPIKEDB_ERROR; }
@@ -2299,6 +2361,31 @@ SpikeDB_Status spike_db_open(SpikeDB** out, const char* path,
     /* Read or initialize meta */
     if (db->file_size < SPIKEDB_RESERVED_PAGES * (uint64_t)SPIKEDB_PAGE_SIZE) {
         if (db->readonly) goto fail;
+        /* Format only an empty file, or what an interrupted format leaves:
+         * format writes zeroed symdir pages and the meta pages last, so
+         * such a file holds nothing but zero page bodies. A truncated
+         * database or a file that never was one — even one whose first
+         * page happens to be zero — keeps every byte it has. */
+        if (db->file_size > 0) {
+            uint8_t* page = (uint8_t*)malloc(SPIKEDB_PAGE_SIZE);
+            if (!page) goto fail;
+            memset(page, 0, SPIKEDB_PAGE_SIZE);
+            const uint32_t zero_crc = crc32_compute(page, SPDB_PAGE_BODY);
+            const uint64_t pages = (db->file_size + SPIKEDB_PAGE_SIZE - 1) / SPIKEDB_PAGE_SIZE;
+            SpikeDB_Status rs = SPIKEDB_OK;
+            bool blank = true;
+            for (uint64_t p = 0; blank && rs == SPIKEDB_OK && p < pages; p++) {
+                rs = io_read(db, (uint32_t)p, page);
+                for (uint32_t i = 0; rs == SPIKEDB_OK && blank && i < SPDB_PAGE_BODY; i++)
+                    blank = page[i] == 0;
+                uint32_t stored;
+                memcpy(&stored, page + SPDB_PAGE_CRC_OFF, 4);
+                if (rs == SPIKEDB_OK && blank) blank = stored == 0 || stored == zero_crc;
+            }
+            free(page);
+            if (rs != SPIKEDB_OK) goto fail;
+            if (!blank) { fail_status = SPIKEDB_CORRUPT; goto fail; }
+        }
         if (db_format_fresh(db) != SPIKEDB_OK) goto fail;
     } else {
         MetaPage a, b;
@@ -2306,7 +2393,7 @@ SpikeDB_Status spike_db_open(SpikeDB** out, const char* path,
         if (io_read(db, SPIKEDB_META_B_PAGE, &b) != SPIKEDB_OK) goto fail;
         SpikeDB_Status va = meta_validate(&a);
         SpikeDB_Status vb = meta_validate(&b);
-        if (va != SPIKEDB_OK && vb != SPIKEDB_OK) goto fail;
+        if (va != SPIKEDB_OK && vb != SPIKEDB_OK) { fail_status = SPIKEDB_CORRUPT; goto fail; }
         if (va != SPIKEDB_OK) { db->meta_buf[1] = b; db->active_meta = 1; }
         else if (vb != SPIKEDB_OK) { db->meta_buf[0] = a; db->active_meta = 0; }
         else if (a.txn_id >= b.txn_id) { db->meta_buf[0] = a; db->meta_buf[1] = b; db->active_meta = 0; }
@@ -2319,7 +2406,7 @@ SpikeDB_Status spike_db_open(SpikeDB** out, const char* path,
 
 fail:
     spike_db_close(db);
-    return SPIKEDB_ERROR;
+    return fail_status;
 }
 
 SpikeDB_Status spike_db_open_ex(SpikeDB** out, const char* path,
@@ -2541,7 +2628,13 @@ SpikeDB_Status spike_db_read_range(SpikeDB* db, uint64_t symbol,
     if (R == 0) { file_unlock(db); return SPIKEDB_INVAL; }   /* variable-width */
 
     uint32_t leaf, slot;
+    uint64_t gen = db->err_gen;
     cursor_seek(db, symbol, time_lo, 0, time_hi, &leaf, &slot, NULL, NULL);
+    if (db->err_gen != gen) {
+        /* Positioning stops at an unreadable page; that is not "no data". */
+        file_unlock(db);
+        return db->last_error.status != SPIKEDB_OK ? db->last_error.status : SPIKEDB_ERROR;
+    }
 
     uint8_t*  out       = (uint8_t*)dst;
     size_t    copied    = 0;
@@ -2946,12 +3039,29 @@ struct SpikeDB_Iter {
     uint32_t  last_seq;
     uint64_t  last_symbol;
     uint64_t  seen_txn;
+    SpikeDB_Status status;          /* why the walk ended early; OK otherwise */
 
     IterSub*  subs;                 /* multi mode */
     uint32_t* heap;                 /* indices into subs, min-heap on key */
     uint32_t  sub_count;
     uint32_t  heap_len;
 };
+
+/* The positioning and fill helpers stop at a page they cannot read, so a
+ * failure would otherwise look like the end of the range: a short scan of
+ * a damaged file reported as complete. Remember it for
+ * spike_db_iter_status. `gen` is db->err_gen before the step. */
+static void iter_fail(SpikeDB_Iter* it, SpikeDB_Status st) {
+    if (it->status == SPIKEDB_OK) it->status = st;
+    it->exhausted = true;
+}
+
+static void iter_note(SpikeDB_Iter* it, uint64_t gen) {
+    SpikeDB* db = it->db;
+    if (db->err_gen == gen) return;
+    iter_fail(it, db->last_error.status != SPIKEDB_OK ? db->last_error.status
+                                                      : SPIKEDB_ERROR);
+}
 
 /* Find the first record of `symbol` with key >= (time, seq) that is still
  * at or below `time_hi`. Caller holds the shared lock. */
@@ -3062,7 +3172,11 @@ static bool chunk_append(SpikeDB_Iter* it, uint64_t symbol,
         size_t nc = it->buf_cap ? it->buf_cap * 2 : 65536;
         while (nc < it->buf_len + need) nc *= 2;
         uint8_t* nb = (uint8_t*)realloc(it->buf, nc);
-        if (!nb) return false;
+        if (!nb) {
+            set_err(it->db, SPIKEDB_ERROR, 0, SPIKEDB_INVALID_PAGE,
+                    "iterator buffer allocation failed");
+            return false;
+        }
         it->buf = nb;
         it->buf_cap = nc;
     }
@@ -3321,12 +3435,18 @@ static bool iter_resume_key(const SpikeDB_Iter* it, uint64_t* t, uint32_t* s) {
 
 static bool iter_refill(SpikeDB_Iter* it) {
     if (it->exhausted) return false;
-    if (!it->nonblocking) return iter_fill_any(it);
-
     SpikeDB* db = it->db;
-    if (file_lock(db, false) != SPIKEDB_OK) { it->exhausted = true; return false; }
-    if (db_refresh_meta(db) != SPIKEDB_OK) {
-        file_unlock(db); it->exhausted = true; return false;
+    uint64_t gen = db->err_gen;
+    if (!it->nonblocking) {
+        bool got = iter_fill_any(it);
+        iter_note(it, gen);
+        return got;
+    }
+
+    if (file_lock(db, false) != SPIKEDB_OK) { iter_fail(it, SPIKEDB_ERROR); return false; }
+    SpikeDB_Status ms = db_refresh_meta(db);
+    if (ms != SPIKEDB_OK) {
+        file_unlock(db); iter_fail(it, ms); return false;
     }
 
     uint64_t txn = db->meta_buf[db->active_meta].txn_id;
@@ -3351,15 +3471,26 @@ static bool iter_refill(SpikeDB_Iter* it) {
 
     bool got = iter_fill_any(it);
     file_unlock(db);
+    iter_note(it, gen);
     return got;
+}
+
+/* A scan constructor has only NULL to fail with, so every refusal records
+ * its cause for spike_db_last_error; lock and meta failures record their
+ * own. */
+static SpikeDB_Iter* scan_refused(SpikeDB* db, SpikeDB_Status st, const char* msg) {
+    set_err(db, st, 0, SPIKEDB_INVALID_PAGE, msg);
+    return NULL;
 }
 
 SpikeDB_Iter* spike_db_scan_ex(SpikeDB* db, uint64_t symbol,
                                uint64_t time_lo, uint64_t time_hi,
                                uint32_t flags) {
-    if (!db || time_hi < time_lo) return NULL;
+    if (!db) return NULL;
+    if (time_hi < time_lo)
+        return scan_refused(db, SPIKEDB_INVAL, "scan range is reversed (time_lo > time_hi)");
     SpikeDB_Iter* it = (SpikeDB_Iter*)calloc(1, sizeof(SpikeDB_Iter));
-    if (!it) return NULL;
+    if (!it) return scan_refused(db, SPIKEDB_ERROR, "iterator allocation failed");
     it->db = db; it->symbol = symbol; it->time_lo = time_lo; it->time_hi = time_hi;
     it->cur_leaf    = SPIKEDB_INVALID_PAGE;
     it->nonblocking = (flags & SPIKEDB_SCAN_NONBLOCKING) != 0;
@@ -3369,9 +3500,11 @@ SpikeDB_Iter* spike_db_scan_ex(SpikeDB* db, uint64_t symbol,
     if (db_refresh_meta(db) != SPIKEDB_OK) { file_unlock(db); free(it); return NULL; }
 
     it->seen_txn = db->meta_buf[db->active_meta].txn_id;
+    uint64_t gen = db->err_gen;
     if (it->reverse) iter_position_rev(it, time_hi, UINT32_MAX);
     else             iter_position(it, time_lo, 0);
     if (it->cur_leaf == SPIKEDB_INVALID_PAGE) it->exhausted = true;
+    iter_note(it, gen);
 
     if (it->nonblocking) file_unlock(db);
     else it->locked = true;
@@ -3387,12 +3520,14 @@ SpikeDB_Iter* spike_db_scan_multi(SpikeDB* db,
                                   const uint64_t* symbols, size_t count,
                                   uint64_t time_lo, uint64_t time_hi,
                                   uint32_t flags) {
-    if (!db || time_hi < time_lo) return NULL;
-    if (count && !symbols) return NULL;
-    if (count > UINT32_MAX) return NULL;
+    if (!db) return NULL;
+    if (time_hi < time_lo)
+        return scan_refused(db, SPIKEDB_INVAL, "scan range is reversed (time_lo > time_hi)");
+    if (count && !symbols) return scan_refused(db, SPIKEDB_INVAL, "symbol list is NULL");
+    if (count > UINT32_MAX) return scan_refused(db, SPIKEDB_INVAL, "too many symbols for one scan");
 
     SpikeDB_Iter* it = (SpikeDB_Iter*)calloc(1, sizeof(SpikeDB_Iter));
-    if (!it) return NULL;
+    if (!it) return scan_refused(db, SPIKEDB_ERROR, "iterator allocation failed");
     it->db = db; it->time_lo = time_lo; it->time_hi = time_hi;
     it->cur_leaf    = SPIKEDB_INVALID_PAGE;
     it->multi       = true;
@@ -3404,7 +3539,7 @@ SpikeDB_Iter* spike_db_scan_multi(SpikeDB* db,
         it->heap = (uint32_t*)calloc(count, sizeof(uint32_t));
         if (!it->subs || !it->heap) {
             free(it->subs); free(it->heap); free(it);
-            return NULL;
+            return scan_refused(db, SPIKEDB_ERROR, "iterator allocation failed");
         }
         for (size_t i = 0; i < count; i++) {
             it->subs[i].symbol = symbols[i];
@@ -3425,8 +3560,10 @@ SpikeDB_Iter* spike_db_scan_multi(SpikeDB* db,
 
     it->seen_txn = db->meta_buf[db->active_meta].txn_id;
     if (count) {
+        uint64_t gen = db->err_gen;
         multi_reposition(it, time_lo, 0, false, 0);
         if (it->heap_len == 0) it->exhausted = true;
+        iter_note(it, gen);
     }
 
     if (it->nonblocking) file_unlock(db);
@@ -3515,6 +3652,10 @@ void spike_db_iter_close(SpikeDB_Iter* it) {
     free(it);
 }
 
+SpikeDB_Status spike_db_iter_status(const SpikeDB_Iter* it) {
+    return it ? it->status : SPIKEDB_INVAL;
+}
+
 SpikeDB_Status spike_db_iter_seek(SpikeDB_Iter* it, uint64_t time, uint32_t seq) {
     if (!it) return SPIKEDB_INVAL;
     if (it->multi) return SPIKEDB_INVAL;
@@ -3531,12 +3672,15 @@ SpikeDB_Status spike_db_iter_seek(SpikeDB_Iter* it, uint64_t time, uint32_t seq)
     it->buf_pos   = 0;
     it->started   = false;
     it->exhausted = false;
+    it->status    = SPIKEDB_OK;
+    uint64_t gen  = db->err_gen;
     if (it->reverse) iter_position_rev(it, time, seq);
     else             iter_position(it, time, seq);
     if (it->cur_leaf == SPIKEDB_INVALID_PAGE) it->exhausted = true;
+    iter_note(it, gen);
 
     if (need_lock) file_unlock(db);
-    return SPIKEDB_OK;
+    return it->status;
 }
 
 /*============================================================================
@@ -4095,6 +4239,63 @@ SpikeDB_Status spike_db_prefetch(SpikeDB* db, uint64_t symbol,
     return SPIKEDB_OK;
 }
 
+/* Open the backup destination without truncating it, refuse it if it is
+ * the database file itself — "wb" would empty the live file before a page
+ * had been copied — and only then truncate. NULL means failure, with the
+ * cause recorded in last_error. */
+static FILE* backup_open(SpikeDB* db, const char* path) {
+#ifdef _WIN32
+    HANDLE h = path_create_file(path, GENERIC_WRITE, OPEN_ALWAYS);
+    if (h == INVALID_HANDLE_VALUE) {
+        set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
+                "backup destination could not be opened");
+        return NULL;
+    }
+    if (same_file(h, db->fd)) {
+        CloseHandle(h);
+        set_err(db, SPIKEDB_INVAL, 0, SPIKEDB_INVALID_PAGE,
+                "backup destination is the database file itself");
+        return NULL;
+    }
+    int fd = SetEndOfFile(h) ? _open_osfhandle((intptr_t)h, 0) : -1;
+    if (fd < 0) {
+        set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
+                "backup destination could not be truncated");
+        CloseHandle(h);
+        return NULL;
+    }
+    FILE* f = _fdopen(fd, "wb");
+    if (!f) _close(fd);
+#else
+    int fd = open(path, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) {
+        set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
+                "backup destination could not be opened");
+        return NULL;
+    }
+    struct stat a, b;
+    if (fstat(fd, &a) == 0 && fstat(db->fd, &b) == 0 &&
+        a.st_dev == b.st_dev && a.st_ino == b.st_ino) {
+        close(fd);
+        set_err(db, SPIKEDB_INVAL, 0, SPIKEDB_INVALID_PAGE,
+                "backup destination is the database file itself");
+        return NULL;
+    }
+    if (ftruncate(fd, 0) != 0) {
+        set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
+                "backup destination could not be truncated");
+        close(fd);
+        return NULL;
+    }
+    FILE* f = fdopen(fd, "wb");
+    if (!f) close(fd);
+#endif
+    if (!f)
+        set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
+                "backup destination could not be opened");
+    return f;
+}
+
 SpikeDB_Status spike_db_backup(SpikeDB* db, const char* dest_path) {
     if (!db || !dest_path) return SPIKEDB_INVAL;
 
@@ -4103,13 +4304,16 @@ SpikeDB_Status spike_db_backup(SpikeDB* db, const char* dest_path) {
 
     uint64_t pages = db->meta_buf[db->active_meta].total_pages_allocated;
     uint8_t* buf = (uint8_t*)malloc(SPIKEDB_PAGE_SIZE);
-    FILE*    f   = fopen(dest_path, "wb");
-    if (!buf || !f) {
-        free(buf);
-        if (f) fclose(f);
+    if (!buf) {
         file_unlock(db);
-        return set_err(db, SPIKEDB_ERROR, os_last_error(), SPIKEDB_INVALID_PAGE,
-                       "backup destination could not be opened");
+        return set_err(db, SPIKEDB_ERROR, 0, SPIKEDB_INVALID_PAGE,
+                       "backup buffer allocation failed");
+    }
+    FILE* f = backup_open(db, dest_path);
+    if (!f) {
+        free(buf);
+        file_unlock(db);
+        return db->last_error.status;
     }
 
     SpikeDB_Status st = SPIKEDB_OK;

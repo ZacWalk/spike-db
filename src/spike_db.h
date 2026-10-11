@@ -42,11 +42,15 @@
  * Crash safety
  *----------------------------------------------------------------------------
  *
- * Every `spike_db_write` and `spike_db_truncate_before` is atomic and
- * durable across crashes: copy-on-write data pages are flushed first,
- * then the inactive meta page is rewritten with a new transaction ID
- * and CRC32, then flushed. On open, the meta with the highest valid
- * txn_id wins; a half-completed transaction is invisible.
+ * A commit publishes atomically at the meta flip: data pages are flushed
+ * first, then the inactive meta page is rewritten with a new transaction
+ * ID and CRC32, then flushed. On open, the meta with the highest valid
+ * txn_id wins. Pre-existing pages a commit modifies are written in place
+ * before the flip, though, so a crash or I/O error mid-flush can leave
+ * part of a batch visible and the file failing spike_db_verify. A later
+ * commit does not reliably repair that: it allocates from the older meta,
+ * so it can reuse pages the lost commit had already linked in — see
+ * README "Status" and docs/design.md §5.
  *============================================================================*/
 
 #ifndef SPIKE_DB_H
@@ -119,11 +123,16 @@ typedef struct SpikeDB_Iter   SpikeDB_Iter;
  * API — open / close
  *
  * On open:
+ *   - `path` is UTF-8 (converted to UTF-16 on Windows; a string that is
+ *     not valid UTF-8 is passed to the ANSI file API unchanged).
  *   - `cache_pages_64k` is the page-cache capacity in 64 KB pages. Values
  *     below 16 are silently raised to 16 (1 MiB).
  *   - With `SPIKEDB_OPEN_READONLY`, the file must already exist;
  *     SPIKEDB_ERROR is returned otherwise. Without the flag, a missing
- *     file is created and freshly formatted.
+ *     file is created and freshly formatted, and so is an empty one.
+ *   - An existing file that is not a SpikeDB database — too short to hold
+ *     one, or with no valid meta page — is left untouched and
+ *     SPIKEDB_CORRUPT is returned.
  *
  * On close:
  *   - If a transaction is in progress (started by `spike_db_batch_put` /
@@ -153,7 +162,7 @@ SpikeDB_Status spike_db_open_ex(SpikeDB** out, const char* path,
                                 const SpikeDB_Options* opts);
 
 /* Library version as MAJOR*10000 + MINOR*100 + PATCH, and the on-disk
- * format version (6). A file written by a different format version cannot
+ * format version (7). A file written by a different format version cannot
  * be opened. */
 uint32_t spike_db_version(void);
 uint32_t spike_db_format_version(void);
@@ -335,6 +344,19 @@ SpikeDB_Status spike_db_sync(SpikeDB* db);
  * become a live tail.
  *============================================================================*/
 
+/* A range with no records in it, or a symbol never written, is not a
+ * failure: the iterator yields nothing and spike_db_iter_status stays
+ * SPIKEDB_OK. NULL means no iterator could be made, and
+ * spike_db_last_error says why:
+ *   - SPIKEDB_INVAL: time_lo > time_hi. A reversed range is refused as a
+ *     caller mistake, as read_range and delete_range refuse it, rather than
+ *     read as empty, which would hide swapped arguments.
+ *     SPIKEDB_SCAN_REVERSE reverses the walk, not the arguments.
+ *   - SPIKEDB_ERROR: allocating the iterator, taking the reader lock or
+ *     reading a meta page failed.
+ *   - SPIKEDB_CORRUPT: neither meta page is valid.
+ * A NULL `db` returns NULL with no handle to report through. NULL is safe
+ * to pass to iter_next (returns false) and iter_close (does nothing). */
 SpikeDB_Iter* spike_db_scan(SpikeDB* db, uint64_t symbol,
                             uint64_t time_lo, uint64_t time_hi);
 SpikeDB_Iter* spike_db_scan_ex(SpikeDB* db, uint64_t symbol,
@@ -366,8 +388,18 @@ size_t        spike_db_iter_next_batch(SpikeDB_Iter* it,
 /* Reposition a single-symbol iterator at `(time, seq)` and resume from
  * there in its current direction, discarding anything buffered. Cheaper
  * than closing and reopening because the lock and buffer are reused.
+ * Starts a new walk, so it clears spike_db_iter_status; a page it cannot
+ * read while positioning is returned as that status.
  * Not supported on merged iterators. */
 SpikeDB_Status spike_db_iter_seek(SpikeDB_Iter* it, uint64_t time, uint32_t seq);
+
+/* Why the walk stopped. iter_next returning false (or next_batch returning
+ * 0) means "end of range" only while this is SPIKEDB_OK. A page that fails
+ * its checksum (SPIKEDB_CORRUPT), an I/O or lock error (SPIKEDB_ERROR) or a
+ * failed allocation ends the iterator early instead: records before the
+ * failure are still delivered, nothing after it is. spike_db_last_error
+ * describes the failure. NULL returns SPIKEDB_INVAL. */
+SpikeDB_Status spike_db_iter_status(const SpikeDB_Iter* it);
 
 void          spike_db_iter_close(SpikeDB_Iter* it);
 
@@ -391,6 +423,9 @@ void          spike_db_iter_close(SpikeDB_Iter* it);
  * records that landed behind it are skipped rather than emitted late.
  *============================================================================*/
 
+/* NULL and empty results follow spike_db_scan; a NULL `symbols` with a
+ * non-zero `count`, or a `count` above UINT32_MAX, is SPIKEDB_INVAL too.
+ * An empty list (count 0) yields an empty iterator. */
 SpikeDB_Iter* spike_db_scan_multi(SpikeDB* db,
                                   const uint64_t* symbols, size_t count,
                                   uint64_t time_lo, uint64_t time_hi,
@@ -455,7 +490,10 @@ SpikeDB_Status spike_db_prefetch(SpikeDB* db, uint64_t symbol,
 
 /* Consistent online copy of the whole file, for archiving or for cloning
  * production data to a research box. Holds the reader lock for the
- * duration, so writers wait; take backups off a replica if that matters. */
+ * duration, so writers wait; take backups off a replica if that matters.
+ * `dest_path` is UTF-8 like the open path; an existing file there is
+ * replaced, except the database file itself (by any name or hard link),
+ * which is refused with SPIKEDB_INVAL and left untouched. */
 SpikeDB_Status spike_db_backup(SpikeDB* db, const char* dest_path);
 
 /* Remove a symbol entirely: every record, its leaves, its index nodes and
