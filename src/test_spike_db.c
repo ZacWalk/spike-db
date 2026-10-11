@@ -2376,6 +2376,17 @@ TEST(test_page_checksum_detects_corruption) {
 
     CHECK(strcmp(spike_db_strerror(SPIKEDB_CORRUPT), "") != 0, "strerror");
 
+    /* A scan stops at the damaged page. That must not read as the end of
+     * the data, or a backtest silently runs on a truncated series. */
+    SpikeDB_Iter* it = spike_db_scan(db, 60, 0, UINT64_MAX);
+    CHECK(it != NULL, "scan");
+    size_t seen = 0; uint64_t t; const void* v; size_t vl;
+    while (spike_db_iter_next(it, &t, &v, &vl)) seen++;
+    SpikeDB_Status ist = spike_db_iter_status(it);
+    spike_db_iter_close(it);
+    CHECK(seen < 3000, "scan read through a corrupt page (%zu records)", seen);
+    CHECK(ist == SPIKEDB_CORRUPT, "scan over a corrupt page: iter status %d", (int)ist);
+
     spike_db_close(db);
     cleanup();
     PASS();
@@ -2969,6 +2980,7 @@ TEST(test_api_rejects_null_arguments) {
     CHECK(!spike_db_iter_next_multi(NULL, &u, &u, &sq, &cv, &vl), "iter_next_multi");
     CHECK(spike_db_iter_next_batch(NULL, recs, 4) == 0, "iter_next_batch");
     CHECK(spike_db_iter_seek(NULL, 0, 0) == SPIKEDB_INVAL, "iter_seek");
+    CHECK(spike_db_iter_status(NULL) == SPIKEDB_INVAL, "iter_status");
 
     /* Diagnostics must survive a handle that never opened. */
     spike_db_stats(NULL, &stats);
@@ -3473,14 +3485,39 @@ TEST(test_io_read_failure_is_reported) {
     for (int n = 1; n <= 12; n++) {
         fault_arm(FAULT_READ, (uint64_t)n);
         size_t seen = 0;
+        SpikeDB_Status ist = SPIKEDB_OK;
         SpikeDB_Iter* it = spike_db_scan(db, 33, 0, UINT64_MAX);
         if (it) {
             uint64_t t; const void* v; size_t l;
             while (spike_db_iter_next(it, &t, &v, &l)) seen++;
+            ist = spike_db_iter_status(it);
             spike_db_iter_close(it);
         }
         if (!g_fault.fired) continue;
         CHECK(seen < 3000, "scan %d returned a full result through a read error", n);
+        CHECK(!it || ist != SPIKEDB_OK, "scan %d reported a clean end through a read error", n);
+    }
+
+    /* Non-blocking scans read under a fresh lock per chunk, so a fault can
+     * also land in the meta refresh between chunks. */
+    spike_db_internal_set_io(db, NULL);
+    spike_db_close(db);
+    CHECK(spike_db_open(&db, TEST_DB_PATH, 16u, 0) == SPIKEDB_OK, "reopen with a small cache");
+    spike_db_internal_set_io(db, &g_fault_ops);
+    for (int n = 1; n <= 40; n++) {
+        fault_arm(FAULT_READ, (uint64_t)n);
+        size_t seen = 0;
+        SpikeDB_Status ist = SPIKEDB_OK;
+        SpikeDB_Iter* it = spike_db_scan_ex(db, 33, 0, UINT64_MAX, SPIKEDB_SCAN_NONBLOCKING);
+        if (it) {
+            uint64_t t; const void* v; size_t l;
+            while (spike_db_iter_next(it, &t, &v, &l)) seen++;
+            ist = spike_db_iter_status(it);
+            spike_db_iter_close(it);
+        }
+        if (!g_fault.fired) continue;
+        CHECK(!it || ist != SPIKEDB_OK, "non-blocking scan %d ended cleanly after %zu records "
+              "through a read error", n, seen);
     }
 
     /* Clearing the fault restores normal service — no leaked pins, no lock
@@ -3584,6 +3621,290 @@ TEST(test_handle_invariants_hold) {
     PASS();
 }
 
+/*============================================================================
+ * Files that are not, or no longer, whole databases
+ *============================================================================*/
+
+static long file_size_of(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    long n = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    fclose(f);
+    return n;
+}
+
+/* Cut a file down to its first `keep` bytes, portably. */
+static bool keep_prefix(const char* path, long keep) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    char* buf = (char*)malloc((size_t)keep);
+    bool ok = buf && fread(buf, 1, (size_t)keep, f) == (size_t)keep;
+    fclose(f);
+    if (ok) {
+        f = fopen(path, "wb");
+        ok = f && fwrite(buf, 1, (size_t)keep, f) == (size_t)keep;
+        if (f) fclose(f);
+    }
+    free(buf);
+    return ok;
+}
+
+TEST(test_open_preserves_foreign_files) {
+    cleanup();
+    SpikeDB* db = NULL;
+
+    /* Opening the wrong path must never format someone else's file. */
+    static const char text[] = "not a database\n";
+    FILE* f = fopen(TEST_DB_PATH, "wb");
+    CHECK(f != NULL, "create text file");
+    fwrite(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    SpikeDB_Status st = spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0);
+    CHECK(st == SPIKEDB_CORRUPT, "text file: status %d", (int)st);
+    CHECK(file_size_of(TEST_DB_PATH) == (long)sizeof(text) - 1, "text file untouched");
+
+    /* A database cut short of its reserved pages must not come back empty. */
+    cleanup();
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    CHECK(seed_symbol(db, 70, 0, 2000) == SPIKEDB_OK, "seed");
+    spike_db_close(db);
+    CHECK(keep_prefix(TEST_DB_PATH, 4L * SPIKEDB_PAGE_SIZE), "truncate copy");
+    st = spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0);
+    CHECK(st == SPIKEDB_CORRUPT, "truncated database: status %d", (int)st);
+    CHECK(file_size_of(TEST_DB_PATH) == 4L * SPIKEDB_PAGE_SIZE, "truncated file untouched");
+
+    /* An empty file is formatted like a missing one, except read-only. */
+    cleanup();
+    f = fopen(TEST_DB_PATH, "wb");
+    CHECK(f != NULL, "create empty file");
+    fclose(f);
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, SPIKEDB_OPEN_READONLY) != SPIKEDB_OK,
+          "read-only open of an empty file");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "empty file formatted");
+    spike_db_close(db);
+
+    /* So is a format that stopped before its meta pages landed, which
+     * leaves page 0 a hole. */
+    cleanup();
+    static char zeros[3 * 65536];
+    f = fopen(TEST_DB_PATH, "wb");
+    CHECK(f != NULL, "create interrupted format");
+    fwrite(zeros, 1, sizeof(zeros), f);
+    fclose(f);
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "interrupted format redone");
+    uint64_t c = 1;
+    CHECK(spike_db_count(db, 70, &c) == SPIKEDB_OK && c == 0, "redone format is empty");
+    spike_db_close(db);
+
+    /* And one that got as far as some symbol directory pages — zero bodies
+     * under their checksums — before the metas. */
+    cleanup();
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "fresh format");
+    spike_db_close(db);
+    CHECK(keep_prefix(TEST_DB_PATH, 5L * SPIKEDB_PAGE_SIZE), "keep the metas and three symdir pages");
+    f = fopen(TEST_DB_PATH, "r+b");
+    CHECK(f != NULL, "reopen to punch out the metas");
+    fwrite(zeros, 1, 2 * 65536, f);
+    fclose(f);
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK,
+          "format interrupted after symdir pages redone");
+    spike_db_close(db);
+
+    /* A short file that is not a database keeps its bytes even when its
+     * first page happens to be zero. */
+    cleanup();
+    f = fopen(TEST_DB_PATH, "wb");
+    CHECK(f != NULL, "create zero-headed file");
+    fwrite(zeros, 1, 65536, f);
+    fwrite(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    st = spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0);
+    CHECK(st == SPIKEDB_CORRUPT, "zero-headed file: status %d", (int)st);
+    CHECK(file_size_of(TEST_DB_PATH) == 65536L + (long)sizeof(text) - 1, "zero-headed file untouched");
+    cleanup();
+    PASS();
+}
+
+TEST(test_backup_refuses_its_own_file) {
+    cleanup();
+    SpikeDB* db = NULL;
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    CHECK(seed_symbol(db, 71, 0, 1500) == SPIKEDB_OK, "seed");
+
+    /* "wb" on the live file would empty it before a page was copied. */
+    CHECK(spike_db_backup(db, TEST_DB_PATH) == SPIKEDB_INVAL, "backup onto itself refused");
+    SpikeDB_Error err;
+    spike_db_last_error(db, &err);
+    CHECK(err.status == SPIKEDB_INVAL, "refusal reported: %d", (int)err.status);
+    CHECK(scan_count(db, 71, 0, UINT64_MAX) == 1500, "live handle still reads everything");
+    spike_db_close(db);
+
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, SPIKEDB_OPEN_READONLY) == SPIKEDB_OK,
+          "file still opens");
+    CHECK(spike_db_backup(db, TEST_DB_PATH) == SPIKEDB_INVAL, "read-only handle refused too");
+    uint64_t c = 0;
+    CHECK(spike_db_count(db, 71, &c) == SPIKEDB_OK && c == 1500, "file intact: %llu",
+          (unsigned long long)c);
+    SpikeDB_VerifyReport rep;
+    CHECK(spike_db_verify(db, &rep) == SPIKEDB_OK, "verify: %s", rep.first_error);
+    spike_db_close(db);
+    cleanup();
+    PASS();
+}
+
+TEST(test_read_range_reports_corrupt_page) {
+    cleanup();
+    SpikeDB* db = NULL;
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    CHECK(spike_db_symbol_define(db, 73, 16) == SPIKEDB_OK, "define");
+    CHECK(seed_symbol(db, 73, 0, 500) == SPIKEDB_OK, "seed");
+    size_t n = 0;
+    CHECK(spike_db_read_range(db, 73, 0, UINT64_MAX, NULL, 0, &n) == SPIKEDB_OK && n == 500,
+          "clean count %zu", n);
+    spike_db_close(db);
+
+    /* Page 18 is the symbol root, 19 its first (and only) leaf. */
+    CHECK(corrupt_page(SPIKEDB_RESERVED_PAGES + 1, 3000), "corrupt");
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "reopen");
+    n = 12345;
+    SpikeDB_Status st = spike_db_read_range(db, 73, 0, UINT64_MAX, NULL, 0, &n);
+    CHECK(st == SPIKEDB_CORRUPT, "read_range over a corrupt leaf: status %d count %zu", (int)st, n);
+    spike_db_close(db);
+    cleanup();
+    PASS();
+}
+
+/* Paths are UTF-8 everywhere; on Windows that needs the wide file API. */
+#define UTF8_DB_PATH  "tmp/spike_db_\xc3\xa9\xe6\xbc\xa2.dat"
+#define UTF8_BAK_PATH "tmp/spike_db_\xc3\xa9\xe6\xbc\xa2.bak"
+#ifdef _WIN32
+#define UTF16_DB_PATH  L"tmp\\spike_db_\x00e9\x6f22.dat"
+#define UTF16_BAK_PATH L"tmp\\spike_db_\x00e9\x6f22.bak"
+static bool exists_named(const wchar_t* wide, const char* utf8) {
+    (void)utf8;
+    return GetFileAttributesW(wide) != INVALID_FILE_ATTRIBUTES;
+}
+static void remove_named(const wchar_t* wide, const char* utf8) {
+    (void)utf8;
+    DeleteFileW(wide);
+}
+#else
+#define UTF16_DB_PATH  NULL
+#define UTF16_BAK_PATH NULL
+static bool exists_named(const void* wide, const char* utf8) {
+    (void)wide;
+    FILE* f = fopen(utf8, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+static void remove_named(const void* wide, const char* utf8) {
+    (void)wide;
+    remove(utf8);
+}
+#endif
+
+TEST(test_utf8_paths) {
+    remove_named(UTF16_DB_PATH, UTF8_DB_PATH);
+    remove_named(UTF16_BAK_PATH, UTF8_BAK_PATH);
+    SpikeDB* db = NULL;
+    CHECK(spike_db_open(&db, UTF8_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open UTF-8 path");
+    CHECK(seed_symbol(db, 74, 0, 100) == SPIKEDB_OK, "seed");
+    CHECK(spike_db_backup(db, UTF8_BAK_PATH) == SPIKEDB_OK, "backup to UTF-8 path");
+    spike_db_close(db);
+    CHECK(exists_named(UTF16_DB_PATH, UTF8_DB_PATH), "database is under its Unicode name");
+    CHECK(exists_named(UTF16_BAK_PATH, UTF8_BAK_PATH), "backup is under its Unicode name");
+    CHECK(spike_db_open(&db, UTF8_BAK_PATH, TEST_CACHE, SPIKEDB_OPEN_READONLY) == SPIKEDB_OK,
+          "backup opens");
+    uint64_t c = 0;
+    CHECK(spike_db_count(db, 74, &c) == SPIKEDB_OK && c == 100, "backup holds %llu",
+          (unsigned long long)c);
+    spike_db_close(db);
+    remove_named(UTF16_DB_PATH, UTF8_DB_PATH);
+    remove_named(UTF16_BAK_PATH, UTF8_BAK_PATH);
+    PASS();
+}
+
+/*============================================================================
+ * A scan that cannot start
+ *============================================================================*/
+
+static SpikeDB_Status last_status(SpikeDB* db) {
+    SpikeDB_Error err;
+    spike_db_last_error(db, &err);
+    return err.status;
+}
+
+/* Leave a lock failure in last_error, so a check for any other status
+ * proves the next call recorded its own cause. Needs g_fault_ops. */
+static void stale_error(SpikeDB* db) {
+    uint64_t c;
+    fault_arm(FAULT_LOCK, 1);
+    (void)spike_db_count(db, 75, &c);
+    fault_arm(FAULT_NONE, 0);
+}
+
+/* A scan constructor can only fail with NULL, so spike_db_last_error has to
+ * say why: a reversed range is the caller's mistake, as read_range and
+ * delete_range report it, not a lock, I/O or allocation failure. */
+TEST(test_scan_null_is_diagnosed) {
+    cleanup();
+    SpikeDB* db = NULL;
+    CHECK(spike_db_open(&db, TEST_DB_PATH, TEST_CACHE, 0) == SPIKEDB_OK, "open");
+    CHECK(seed_symbol(db, 75, 0, 100) == SPIKEDB_OK, "seed");
+    spike_db_internal_set_io(db, &g_fault_ops);
+
+    fault_arm(FAULT_LOCK, 1);
+    CHECK(spike_db_scan(db, 75, 0, 99) == NULL, "scan without the reader lock");
+    CHECK(last_status(db) == SPIKEDB_ERROR, "lock failure reported as %d", (int)last_status(db));
+    fault_arm(FAULT_NONE, 0);
+
+    static const uint32_t flags[3] = { 0, SPIKEDB_SCAN_NONBLOCKING, SPIKEDB_SCAN_REVERSE };
+    for (int i = 0; i < 3; i++) {
+        stale_error(db);
+        CHECK(spike_db_scan_ex(db, 75, 99, 0, flags[i]) == NULL, "flags %u: reversed range", flags[i]);
+        CHECK(last_status(db) == SPIKEDB_INVAL, "flags %u: reversed range reported as %d",
+              flags[i], (int)last_status(db));
+    }
+    stale_error(db);
+    CHECK(spike_db_scan(db, 75, 99, 0) == NULL, "scan: reversed range");
+    CHECK(last_status(db) == SPIKEDB_INVAL, "scan: reported as %d", (int)last_status(db));
+
+    const uint64_t syms[2] = { 75, 76 };
+    stale_error(db);
+    CHECK(spike_db_scan_multi(db, syms, 2, 99, 0, 0) == NULL, "multi: reversed range");
+    CHECK(last_status(db) == SPIKEDB_INVAL, "multi: reported as %d", (int)last_status(db));
+    stale_error(db);
+    CHECK(spike_db_scan_multi(db, NULL, 2, 0, 99, 0) == NULL, "multi: count without symbols");
+    CHECK(last_status(db) == SPIKEDB_INVAL, "multi: missing symbols reported as %d",
+          (int)last_status(db));
+
+    /* NULL is reserved for those: a valid range with nothing in it, or a
+     * symbol never written, is an empty iterator that ends with SPIKEDB_OK. */
+    static const uint64_t empty[2][3] = { { 75, 500, 600 }, { 4242, 0, UINT64_MAX } };
+    for (int i = 0; i < 2; i++) {
+        SpikeDB_Iter* it = spike_db_scan(db, empty[i][0], empty[i][1], empty[i][2]);
+        CHECK(it != NULL, "empty case %d is an iterator", i);
+        uint64_t t; const void* v; size_t l;
+        bool got = spike_db_iter_next(it, &t, &v, &l);
+        SpikeDB_Status st = spike_db_iter_status(it);
+        spike_db_iter_close(it);
+        CHECK(!got && st == SPIKEDB_OK, "empty case %d: got %d, status %d", i, (int)got, (int)st);
+    }
+
+    /* With no valid meta page left on disk the scan cannot start either. */
+    CHECK(corrupt_page(SPIKEDB_META_A_PAGE, 0) && corrupt_page(SPIKEDB_META_B_PAGE, 0),
+          "damage both meta pages");
+    stale_error(db);
+    CHECK(spike_db_scan(db, 75, 0, 99) == NULL, "scan with no valid meta page");
+    CHECK(last_status(db) == SPIKEDB_CORRUPT, "no valid meta page reported as %d",
+          (int)last_status(db));
+
+    spike_db_internal_set_io(db, NULL);
+    spike_db_close(db);
+    cleanup();
+    PASS();
+}
+
 int main(void) {
 #ifdef _WIN32
     /* ensure tmp/ exists */
@@ -3658,6 +3979,11 @@ int main(void) {
     run_test_io_read_failure_is_reported();
     run_test_lock_failure_is_reported();
     run_test_handle_invariants_hold();
+    run_test_open_preserves_foreign_files();
+    run_test_backup_refuses_its_own_file();
+    run_test_read_range_reports_corrupt_page();
+    run_test_utf8_paths();
+    run_test_scan_null_is_diagnosed();
 
     printf("\n================\n");
     printf("Results: %d/%d passed, %d failed\n", g_pass, g_run, g_fail);

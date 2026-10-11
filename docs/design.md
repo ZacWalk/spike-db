@@ -388,6 +388,13 @@ leaf instead of once per record.
 `spike_db_iter_next_batch` exposes the chunk directly for replay loops.
 A short non-zero return only means the chunk ran out.
 
+Positioning and the chunk fill stop at a page they cannot read (failed
+checksum, I/O or lock error, allocation failure). Every recorded failure
+bumps the handle's `err_gen`; the iterator compares it around each step
+and keeps the cause in its `status`, so `spike_db_iter_status` tells a
+damaged page apart from the end of the range. Records before the failure
+are still delivered. `read_range` uses the same check around positioning.
+
 #### Isolation
 
 The default mode holds the shared lock for the iterator's lifetime. The
@@ -557,8 +564,14 @@ reused via the watermark.
 
 **Recovery** (`spike_db_open`): read both meta pages, validate magic and
 CRC, and adopt the valid one with the higher `txn_id`. If neither
-validates, the open fails. Anything written by a half-completed
-transaction is unreachable from the surviving meta.
+validates, the open fails with `SPIKEDB_CORRUPT`. Anything written by a
+half-completed transaction is unreachable from the surviving meta. A
+file shorter than the reserved pages is formatted only if it is empty or
+holds nothing but zero page bodies — what an interrupted format leaves,
+since format writes the zeroed symbol directory first and the meta pages
+last; a truncated database or a file that never was one, even one whose
+first page happens to be zero, is refused with `SPIKEDB_CORRUPT`,
+untouched.
 
 #### Where this is not yet true
 
@@ -573,7 +586,13 @@ the second page write of a commit and finds a file whose root page reports
 the new record count while the leaf chain is still the old one —
 `spike_db_verify` calls it corrupt. The next successful commit rewrites
 both consistently and repairs it, but a reader in between sees a database
-that does not verify.
+that does not verify. A commit made after the flip itself was lost — a
+torn or damaged newest meta, or a crash just before it — is worse off: it
+starts from the older meta's allocation watermark and can hand out pages
+the lost commit had already linked in through in-place pages. Measured: a
+symbol the lost commit added through the symbol directory ended up
+sharing its root page with the next symbol written, and its scans
+returned that symbol's records with no error.
 
 So the accurate statement today is: **the meta flip is atomic; the flush
 that precedes it is not.** Making a batch genuinely all-or-nothing needs

@@ -207,6 +207,8 @@ bool           spike_db_iter_next_seq(SpikeDB_Iter* it, uint64_t* time_out,
 /* bulk form for replay loops */
 size_t         spike_db_iter_next_batch(SpikeDB_Iter* it,
                                         SpikeDB_Rec* out, size_t max);
+/* why iteration stopped: OK = end of range, else the page/I-O error */
+SpikeDB_Status spike_db_iter_status  (const SpikeDB_Iter* it);
 void           spike_db_iter_close   (SpikeDB_Iter* it);
 SpikeDB_Status spike_db_iter_seek    (SpikeDB_Iter* it, uint64_t time,
                                       uint32_t seq);
@@ -295,6 +297,18 @@ SpikeDB_Status spike_db_verify (SpikeDB* db, SpikeDB_VerifyReport* out);
   scans. `spike_db_scan_ex` with `SPIKEDB_SCAN_NONBLOCKING` releases the
   lock between chunks; the scan is then read-committed rather than a
   stable snapshot.
+- An iterator that hits a page it cannot read (failed checksum, I/O
+  error) stops there, so after `spike_db_iter_next` returns false check
+  `spike_db_iter_status`: `SPIKEDB_OK` means the range really ended.
+- A scan returns NULL only when it cannot start, and `spike_db_last_error`
+  says why: `SPIKEDB_INVAL` for a reversed range (`time_lo > time_hi`),
+  refused as `read_range` and `delete_range` refuse it, otherwise the
+  lock, meta page or allocation failure. A range with no records is an
+  empty iterator, not NULL.
+- Paths are UTF-8 on every platform. Opening an existing file that is not
+  a SpikeDB database (too short, or no valid meta page) returns
+  `SPIKEDB_CORRUPT` and leaves it untouched; only a missing or empty file
+  is formatted. `spike_db_backup` refuses the database's own file.
 - Maximum value length is 65000 bytes (a value must fit in a leaf with
   room for at least its own slot directory entry).
 - Close every iterator before the handle it came from. An iterator
@@ -335,7 +349,7 @@ The same entry point runs on Linux and in WSL under `pwsh`. dd discovers
 the Windows MSVC environment and toolchain; `./dd.ps1 doctor` diagnoses
 missing prerequisites without installing anything. Bare `./dd.ps1` shows
 help. `run` and `launch` reject the library target; `test_spike_db` is the
-default runnable CLI and still contains all 63 tests.
+default runnable CLI and still contains all 68 tests.
 
 CI runs on Windows and Linux for pushes, pull requests and manual dispatch.
 It validates dependency declarations, checks the toolchain, then builds/tests
@@ -419,9 +433,13 @@ All of the above is implemented and covered by the test suite. Known gaps
 meta flip, but the page writes that precede the flip go to *pre-existing*
 pages in place. If the process dies, or an I/O error occurs, after some of
 those writes have landed and before the flip, the file can be left
-internally inconsistent — `spike_db_verify` will report it, and the next
-successful commit repairs it, but a batch is not all-or-nothing under a
-power cut. Closing this needs an undo/redo log and therefore a format
+internally inconsistent — `spike_db_verify` will report it. The next
+successful commit does not reliably repair it: it allocates from the
+older meta, so it can hand out pages the lost commit had already linked
+in (measured: a symbol the lost commit added ended up sharing its root
+page with the next symbol written, and read that symbol's records). A
+batch is not all-or-nothing under a power cut. Closing this needs an
+undo/redo log and therefore a format
 change; it is the top item in [docs/testing.md](docs/testing.md) §6.
 Until then, treat SpikeDB as a store whose system of record is upstream
 (the exchange, the vendor file) and use the transactional ingest cursor
