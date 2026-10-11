@@ -16,9 +16,9 @@ function Invoke-Driver([string[]]$Arguments, [int]$ExpectedExit = 0) {
 
 $upstream = Get-Content (Join-Path $root 'docs/dd-upstream.json') -Raw | ConvertFrom-Json -AsHashtable
 if ($upstream.repository -ne 'https://github.com/ZacWalk/dd' -or
-    $upstream.revision -ne '7ea3477860c9154c1f059cf3e6ad8df71f0dc912' -or
-    $upstream.version -ne '0.2.1') {
-    throw 'Expected the reviewed dd v0.2.1 release.'
+    $upstream.revision -ne '114890d721907dee64651371947f49dd33dad27c' -or
+    $upstream.version -ne '0.2.2') {
+    throw 'Expected the reviewed dd v0.2.2 release.'
 }
 $vendoredFiles = @('dd.ps1') + @(
     Get-ChildItem (Join-Path $root '.dd') -Recurse -File -Force |
