@@ -26,7 +26,7 @@ src/spike_db.h            public header + API contracts
 src/spike_db_internal.h   test-only hooks (I/O table, CRC probe, audit)
 src/test_spike_db.c       test suite (self-contained harness, no framework)
 CMakeLists.txt            build definition (CMake + Ninja)
-dd.ps1 + .dd/             unmodified dd v0.2.1 runtime (do not fork)
+dd.ps1 + .dd/             unmodified dd v0.2.2 runtime (do not fork)
 dd.psd1                   library/CLI metadata and project commands
 CMakePresets.json         native and isolated verification presets
 scripts/verify.ps1        project-command adapter using dd build/test helpers
