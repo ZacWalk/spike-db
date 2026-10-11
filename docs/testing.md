@@ -23,7 +23,7 @@ See [docs/design.md](design.md) for the mechanisms these claims rest on.
 
 ## 0. Where we are today
 
-`src/test_spike_db.c` holds 63 deterministic tests on a small built-in
+`src/test_spike_db.c` holds 68 deterministic tests on a small built-in
 harness (`TEST` / `CHECK` / `PASS`), run by `dd.ps1` on MSVC and GCC. They cover open/close, put/get, persistence across reopen, ordered
 and bounded scans, multi-symbol isolation, out-of-order and mid-leaf
 inserts, `min`/`max`/`count`, batch atomicity on duplicates, retention,
@@ -34,7 +34,7 @@ non-blocking and reverse scans, merged multi-symbol replay, page-checksum
 corruption detection, `spike_db_verify`, fixed-width leaves and
 `read_range`, symbol drop, backup, and durability control.
 
-Five of them defend the caller rather than the engine, because the first
+Six of them defend the caller rather than the engine, because the first
 thing a new user does is hold the API wrong:
 
 | Test | Claim |
@@ -42,6 +42,7 @@ thing a new user does is hold the API wrong:
 | `test_crc32_paths_agree` | The SSE4.2 and table-driven CRC-32C paths agree at every length and alignment, and both match the standard check value — a file written on one machine stays readable on another |
 | `test_api_rejects_null_arguments` | Every public entry point rejects a NULL handle, batch, iterator or output pointer instead of dereferencing it; destructors accept NULL |
 | `test_api_misuse_is_diagnosed` | Replaying an uncleared batch, exceeding the value limit, re-declaring a fixed width, writing a wrong-width value, reversing a range, seeking a merged iterator and overflowing the ingest cursor all fail cleanly and atomically |
+| `test_scan_null_is_diagnosed` | A scan that returns NULL says why in `spike_db_last_error`: `SPIKEDB_INVAL` for a reversed range (every flag, and merged) or a missing symbol list, `SPIKEDB_ERROR` for a lock failure, `SPIKEDB_CORRUPT` with no valid meta page; a valid range with no records is an empty iterator |
 | `test_readonly_rejects_mutations` | Every mutating call on a read-only handle returns an error, reads and backup still work, and the txn id never moves |
 | `test_boundary_keys_and_values` | `symbol == 0`, `time == 0`, `time == UINT64_MAX`, `seq == UINT32_MAX`, zero-length values and degenerate/empty ranges all round-trip through the file |
 
@@ -51,9 +52,18 @@ And five reach the failure paths through the injectable I/O table:
 |---|---|
 | `test_io_write_failure_unwinds` | Failing the Nth page write of a commit, for every N, reports the failure, leaves the handle answerable and the file openable; a fault before any write lands is fully atomic |
 | `test_io_fsync_failure_is_reported` | A failed data barrier is reported; a failed meta barrier leaves the old or the new state, never a third one, and the file still takes writes |
-| `test_io_read_failure_is_reported` | A failed read produces an error, never a wrong answer or a partial scan reported as complete; clearing the fault restores normal service |
+| `test_io_read_failure_is_reported` | A failed read produces an error, never a wrong answer or a partial scan reported as complete (`spike_db_iter_status` names the failure, blocking and non-blocking); clearing the fault restores normal service |
 | `test_lock_failure_is_reported` | Nothing proceeds without the lock it asked for, and no lock is leaked when acquisition fails |
 | `test_handle_invariants_hold` | `spike_db_internal_check` is clean after open, write, scan, truncate, delete, drop, and after an aborted transaction |
+
+And four keep a mistake or a damaged file from costing data:
+
+| Test | Claim |
+|---|---|
+| `test_open_preserves_foreign_files` | Opening a text file, a database cut short of its reserved pages, or a short file whose first page merely happens to be zero returns `SPIKEDB_CORRUPT` and leaves every byte; only an empty file, or a format interrupted before its meta pages (zero page bodies only), is formatted |
+| `test_backup_refuses_its_own_file` | A backup onto the database's own file is refused (`SPIKEDB_INVAL`) from read-write and read-only handles, and the file is intact |
+| `test_read_range_reports_corrupt_page` | `read_range` over a leaf that fails its checksum returns `SPIKEDB_CORRUPT`, not an empty `SPIKEDB_OK` |
+| `test_utf8_paths` | A UTF-8 database and backup path with non-ASCII characters land under that name (Windows converts to UTF-16) |
 
 CI runs on Windows and Linux for every push, pull request and manual dispatch.
 It first runs `dd.ps1 dep install --non-interactive` and
@@ -65,7 +75,7 @@ Verification passes:
 
 | Pass | Command | Catches |
 |---|---|---|
-| Default | `dd.ps1 test` | All 63 functional tests plus dd adoption checks, in Release and Debug on MSVC and GCC |
+| Default | `dd.ps1 test` | All 68 functional tests plus dd adoption checks, in Release and Debug on MSVC and GCC |
 | Audit | `dd.ps1 audit --yes` | Cache/hash-table/pin invariants at the exit of every mutating call (§5) |
 | Sanitizers | `dd.ps1 asan --yes` (Windows CI adds `--config Debug`) | ASan on MSVC; ASan + UBSan on GCC: out-of-bounds, misaligned loads, leaks |
 | Low-memory | `dd.ps1 lowmem --yes` (16 and 32 pages) | Leaked page pins, which surface as `SPIKEDB_FULL` once the clock sweep runs out of victims |
